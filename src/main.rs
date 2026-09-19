@@ -911,11 +911,28 @@ async fn serve(cli: &Cli, bind: SocketAddr, simulate: bool, sim_in_range: bool) 
     }
     println!("The wearer's app is served at the same address.");
     axum::serve(listener, api::router(state))
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
+        .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())
+}
+
+/// Resolves on Ctrl-C or, under a service manager, SIGTERM, so a stop lets requests finish and the database close.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let term = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let term = std::future::pending::<()>();
+    tokio::select! { _ = ctrl_c => {}, _ = term => {} }
 }
 
 // ---------- discovery ----------

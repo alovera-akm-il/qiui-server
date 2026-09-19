@@ -68,6 +68,51 @@ without approval.
 cargo build --release          # binary: target/release/qiui-server
 ```
 
+### Run it as a service (systemd)
+
+For a machine that stays on, install it as a service that starts at boot and restarts if it fails:
+
+```
+scripts/deploy.sh                       # build, install, enable and start
+scripts/deploy.sh --bind 192.168.1.20:8443   # listen on one address instead of every interface
+```
+
+It is safe to run again: `git pull && scripts/deploy.sh` updates the program in place and keeps your data and settings.
+It does not touch Tailscale, other web servers or firewalls.
+
+| What | Where |
+|---|---|
+| Program | `/usr/local/bin/qiui-server` |
+| Keyholder command line | `/usr/local/bin/qiui-ctl` (same program, run as the service user on the service's data) |
+| Service | `/etc/systemd/system/qiui-server.service` (from `deploy/qiui-server.service`) |
+| Data (database, keys, sealed credentials) | `/var/lib/qiui-server`, owned by the `qiui` user, mode 0700 |
+| Settings | `/etc/qiui-server/service.env` (`QIUI_BIND` only; never put a password here) |
+
+The service runs as a dedicated `qiui` user with no login, in the `bluetooth` group, with a locked-down sandbox
+(read-only system, no home directory, no extra privileges, network limited to IP and local sockets).
+
+Use `qiui-ctl` in place of `qiui-server` for everything, since only the service user can read the data. It runs through `sudo`, which drops environment variables, so give the password with `--password` or type it at the prompt (`QIUI_KEYHOLDER_PASSWORD` does not get through):
+
+```
+qiui-ctl init                     # first time only
+qiui-ctl config set-client-id     # first time only
+qiui-ctl config set-mac E5:26:D6:6E:B6:8A
+qiui-ctl status                   # the first keyholder sign-in after each start unlocks pod control
+```
+
+Day to day:
+
+```
+journalctl -u qiui-server -f      # logs
+sudo systemctl restart qiui-server
+sudo systemctl stop qiui-server
+scripts/deploy.sh --uninstall           # remove the service and program, keep the data
+scripts/deploy.sh --uninstall --purge   # ...and delete the data and the service user
+```
+
+After a reboot or restart the QIUI credentials are sealed again until you sign in as keyholder once
+(any keyholder command does it), so the pod cannot be controlled until then. That is by design.
+
 ### 2. Create the keyholder account
 
 ```

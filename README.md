@@ -38,6 +38,8 @@ qiui-server status                        # then: approve, timer set 14d, queue 
 The pod must first be **unbound from the QiUi phone app**. Passwords can come from `QIUI_*` environment variables, so
 every command is scriptable.
 
+To run it as a systemd service that starts at boot: `scripts/deploy.sh` (see the usage guide).
+
 ## Documentation
 
 - **[Usage guide](docs/usage.md)**: setup, the keyholder's commands, the wearer's screens, security model and limits,

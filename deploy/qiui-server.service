@@ -1,0 +1,47 @@
+[Unit]
+Description=QIUI KeyPod server (keyholder API and wearer app)
+Documentation=file:///usr/local/share/doc/qiui-server/usage.md
+After=network-online.target bluetooth.target
+Wants=network-online.target bluetooth.target
+
+[Service]
+Type=simple
+User=qiui
+Group=qiui
+# Talks to the pod through BlueZ over D-Bus; members of this group may.
+SupplementaryGroups=bluetooth
+
+# Overridable in /etc/qiui-server/service.env (never put passwords there).
+Environment=QIUI_BIND=0.0.0.0:8443
+EnvironmentFile=-/etc/qiui-server/service.env
+Environment=QIUI_DATA_DIR=/var/lib/qiui-server
+ExecStart=/usr/local/bin/qiui-server serve --bind ${QIUI_BIND}
+
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+
+# Data lives in /var/lib/qiui-server, created 0700 for the service user.
+StateDirectory=qiui-server
+StateDirectoryMode=0700
+UMask=0077
+
+# Least privilege: it needs the network, D-Bus and its own state, nothing else.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
