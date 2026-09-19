@@ -71,7 +71,12 @@ pub enum Error {
     ApprovalExpired,
     #[error("duration must be positive, and min must not exceed max")]
     InvalidDuration,
+    #[error("a timer cannot run for more than 365 days in total")]
+    TimerTooLong,
 }
+
+/// The longest a timer may be after adding time to it.
+pub const MAX_TIMER_MS: i64 = 365 * 24 * 60 * 60 * 1000;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -258,6 +263,63 @@ impl Machine {
             ev(actor, "timer_rolled", json!({ "min_ms": min_ms, "max_ms": max_ms, "chosen_ms": chosen_ms, "ends_at_ms": now_ms + chosen_ms })),
         );
         Ok(events)
+    }
+
+    /// Add time to the timer. Running: it ends later. Paused: more time is left, and it stays
+    /// paused. No active timer (none, or one that has ended): a new timer of that length starts,
+    /// exactly as `set_timer` would.
+    pub fn extend_timer(&mut self, actor: Actor, now_ms: i64, add_ms: i64) -> Result<Vec<Event>> {
+        keyholder_only(actor)?;
+        if add_ms <= 0 {
+            return Err(Error::InvalidDuration);
+        }
+        match self.timer {
+            Timer::Running { .. } | Timer::Paused { .. } if self.timer.blocks_unlock(now_ms) => {
+                let detail = self.add_to_active(now_ms, add_ms)?;
+                Ok(vec![ev(actor, "timer_extended", detail)])
+            }
+            _ => self.set_timer(actor, now_ms, add_ms),
+        }
+    }
+
+    /// Add a random amount in `min..=max` (chosen by the caller). Like `roll_timer`, both the range
+    /// and the result are recorded. With no active timer this starts a rolled timer.
+    pub fn extend_timer_roll(&mut self, actor: Actor, now_ms: i64, min_ms: i64, max_ms: i64, chosen_ms: i64) -> Result<Vec<Event>> {
+        keyholder_only(actor)?;
+        if min_ms <= 0 || min_ms > max_ms || chosen_ms < min_ms || chosen_ms > max_ms {
+            return Err(Error::InvalidDuration);
+        }
+        match self.timer {
+            Timer::Running { .. } | Timer::Paused { .. } if self.timer.blocks_unlock(now_ms) => {
+                let mut detail = self.add_to_active(now_ms, chosen_ms)?;
+                detail["min_ms"] = min_ms.into();
+                detail["max_ms"] = max_ms.into();
+                detail["chosen_ms"] = detail["added_ms"].clone();
+                Ok(vec![ev(actor, "timer_extension_rolled", detail)])
+            }
+            _ => self.roll_timer(actor, now_ms, min_ms, max_ms, chosen_ms),
+        }
+    }
+
+    /// Lengthen a running or paused timer, refusing if the total would exceed the cap.
+    fn add_to_active(&mut self, now_ms: i64, add_ms: i64) -> Result<Value> {
+        match self.timer {
+            Timer::Running { ends_at_ms } => {
+                if ends_at_ms - now_ms + add_ms > MAX_TIMER_MS {
+                    return Err(Error::TimerTooLong);
+                }
+                self.timer = Timer::Running { ends_at_ms: ends_at_ms + add_ms };
+                Ok(json!({ "added_ms": add_ms, "ends_at_ms": ends_at_ms + add_ms }))
+            }
+            Timer::Paused { remaining_ms } => {
+                if remaining_ms + add_ms > MAX_TIMER_MS {
+                    return Err(Error::TimerTooLong);
+                }
+                self.timer = Timer::Paused { remaining_ms: remaining_ms + add_ms };
+                Ok(json!({ "added_ms": add_ms, "remaining_ms": remaining_ms + add_ms }))
+            }
+            _ => Err(Error::TimerState("there is no active timer to add to")),
+        }
     }
 
     pub fn pause_timer(&mut self, actor: Actor, now_ms: i64) -> Result<Vec<Event>> {
@@ -479,6 +541,83 @@ mod tests {
         assert_eq!(m.timer, Timer::Running { ends_at_ms: 2 * H });
         assert_eq!(m.roll_timer(Actor::Keyholder, 0, 3 * H, H, 2 * H), Err(Error::InvalidDuration));
         assert_eq!(m.roll_timer(Actor::Keyholder, 0, H, 3 * H, 4 * H), Err(Error::InvalidDuration));
+    }
+
+    #[test]
+    fn adding_time_moves_a_running_timers_end_later() {
+        let mut m = Machine::default();
+        m.set_timer(Actor::Keyholder, 0, 2 * H).unwrap();
+        let e = m.extend_timer(Actor::Keyholder, H, 30 * M).unwrap();
+        assert_eq!(kinds(&e), ["timer_extended"]);
+        assert_eq!(e[0].detail["added_ms"], 30 * M);
+        assert_eq!(m.timer, Timer::Running { ends_at_ms: 2 * H + 30 * M });
+        // Still blocks until the new end, and no approval could have existed under a timer.
+        assert!(m.timer.blocks_unlock(2 * H + 29 * M));
+        assert!(!m.timer.blocks_unlock(2 * H + 30 * M));
+    }
+
+    #[test]
+    fn adding_time_to_a_paused_timer_keeps_it_paused() {
+        let mut m = Machine::default();
+        m.set_timer(Actor::Keyholder, 0, 10 * H).unwrap();
+        m.pause_timer(Actor::Keyholder, 4 * H).unwrap(); // 6 h left
+        let e = m.extend_timer(Actor::Keyholder, 5 * H, 2 * H).unwrap();
+        assert_eq!(e[0].detail["remaining_ms"], 8 * H);
+        assert_eq!(m.timer, Timer::Paused { remaining_ms: 8 * H });
+        // Time passing while paused changes nothing, and resuming counts down the extended amount.
+        m.resume_timer(Actor::Keyholder, 100 * H).unwrap();
+        assert_eq!(m.timer, Timer::Running { ends_at_ms: 108 * H });
+    }
+
+    #[test]
+    fn adding_time_with_no_active_timer_starts_one_and_cancels_a_pending_request() {
+        let mut idle = Machine::default();
+        let e = idle.extend_timer(Actor::Keyholder, 0, H).unwrap();
+        assert_eq!(kinds(&e), ["timer_set"]);
+        assert_eq!(idle.timer, Timer::Running { ends_at_ms: H });
+
+        // A timer that has ended counts as no active timer.
+        let mut ended = Machine::default();
+        ended.set_timer(Actor::Keyholder, 0, H).unwrap();
+        ended.tick(H);
+        ended.request_unlock(Actor::Wearer, H).unwrap();
+        let e = ended.extend_timer(Actor::Keyholder, H, 2 * H).unwrap();
+        assert_eq!(kinds(&e), ["timer_set", "approval_revoked"]);
+        assert_eq!(ended.state, LockState::Locked);
+        assert_eq!(ended.timer, Timer::Running { ends_at_ms: 3 * H });
+    }
+
+    #[test]
+    fn extending_is_keyholder_only_positive_and_capped() {
+        let mut m = Machine::default();
+        m.set_timer(Actor::Keyholder, 0, H).unwrap();
+        let before = m.clone();
+        assert_eq!(m.extend_timer(Actor::Wearer, 0, H), Err(Error::NotPermitted));
+        assert_eq!(m.extend_timer(Actor::System, 0, H), Err(Error::NotPermitted));
+        assert_eq!(m.extend_timer_roll(Actor::Wearer, 0, H, 2 * H, H), Err(Error::NotPermitted));
+        assert_eq!(m.extend_timer(Actor::Keyholder, 0, 0), Err(Error::InvalidDuration));
+        assert_eq!(m.extend_timer(Actor::Keyholder, 0, -H), Err(Error::InvalidDuration));
+        assert_eq!(m.extend_timer(Actor::Keyholder, 0, MAX_TIMER_MS), Err(Error::TimerTooLong));
+        assert_eq!(m, before, "a refused extension changes nothing");
+        // Exactly the cap is fine.
+        m.extend_timer(Actor::Keyholder, 0, MAX_TIMER_MS - H).unwrap();
+    }
+
+    #[test]
+    fn a_random_extension_records_the_range_and_the_result() {
+        let mut m = Machine::default();
+        m.set_timer(Actor::Keyholder, 0, 2 * H).unwrap();
+        let e = m.extend_timer_roll(Actor::Keyholder, 0, H, 3 * H, 2 * H).unwrap();
+        assert_eq!(kinds(&e), ["timer_extension_rolled"]);
+        assert_eq!((e[0].detail["min_ms"].as_i64(), e[0].detail["max_ms"].as_i64(), e[0].detail["chosen_ms"].as_i64()), (Some(H), Some(3 * H), Some(2 * H)));
+        assert_eq!(m.timer, Timer::Running { ends_at_ms: 4 * H });
+        assert_eq!(m.extend_timer_roll(Actor::Keyholder, 0, 3 * H, H, 2 * H), Err(Error::InvalidDuration));
+        assert_eq!(m.extend_timer_roll(Actor::Keyholder, 0, H, 3 * H, 4 * H), Err(Error::InvalidDuration));
+
+        // With nothing to extend, it starts a rolled timer.
+        let mut idle = Machine::default();
+        let e = idle.extend_timer_roll(Actor::Keyholder, 0, H, 3 * H, 2 * H).unwrap();
+        assert_eq!(kinds(&e), ["timer_rolled"]);
     }
 
     #[test]

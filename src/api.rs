@@ -131,7 +131,7 @@ impl From<machine::Error> for ApiError {
     fn from(e: machine::Error) -> Self {
         let status = match e {
             machine::Error::NotPermitted => StatusCode::FORBIDDEN,
-            machine::Error::InvalidDuration => StatusCode::BAD_REQUEST,
+            machine::Error::InvalidDuration | machine::Error::TimerTooLong => StatusCode::BAD_REQUEST,
             _ => StatusCode::CONFLICT,
         };
         Self::new(status, e.to_string())
@@ -444,6 +444,38 @@ async fn kh_timer_roll(State(st): State<AppState>, Json(req): Json<RollTimerReq>
         let (min_ms, max_ms) = (req.min_secs * 1000, req.max_secs * 1000);
         store.apply(now, |m| m.roll_timer(Actor::Keyholder, now, min_ms, max_ms, chosen * 1000))?;
         // The keyholder may see what was rolled; the wearer's view never includes it.
+        let mut view = keyholder_state(store, now)?;
+        view.0["rolled_secs"] = chosen.into();
+        Ok(view)
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+struct AddTimerReq {
+    duration_secs: i64,
+}
+
+async fn kh_timer_add(State(st): State<AppState>, Json(req): Json<AddTimerReq>) -> ApiResult {
+    if !(1..=MAX_TIMER_SECS).contains(&req.duration_secs) {
+        return Err(ApiError::bad_request("duration_secs must be between 1 second and 365 days"));
+    }
+    db(&st, move |store, _, now| {
+        store.apply(now, |m| m.extend_timer(Actor::Keyholder, now, req.duration_secs * 1000))?;
+        keyholder_state(store, now)
+    })
+    .await
+}
+
+async fn kh_timer_add_roll(State(st): State<AppState>, Json(req): Json<RollTimerReq>) -> ApiResult {
+    if req.min_secs < 1 || req.min_secs > req.max_secs || req.max_secs > MAX_TIMER_SECS {
+        return Err(ApiError::bad_request("need 1 <= min_secs <= max_secs <= 365 days"));
+    }
+    db(&st, move |store, _, now| {
+        let span = (req.max_secs - req.min_secs + 1) as u64;
+        let chosen = req.min_secs + accounts::random_below(span) as i64;
+        let (min_ms, max_ms) = (req.min_secs * 1000, req.max_secs * 1000);
+        store.apply(now, |m| m.extend_timer_roll(Actor::Keyholder, now, min_ms, max_ms, chosen * 1000))?;
         let mut view = keyholder_state(store, now)?;
         view.0["rolled_secs"] = chosen.into();
         Ok(view)
@@ -903,7 +935,7 @@ async fn command_reply(st: &AppState, id: &str, intent: Intent, status: PodStatu
 /// What the wearer may see of the audit log: their own lock's story, never the keyholder's
 /// internals. Only the actor and how the pod was reached are exposed; no details, so a
 /// rolled timer's length can never leak through here.
-const ACTIVITY_KINDS: [&str; 19] = [
+const ACTIVITY_KINDS: [&str; 21] = [
     "unlock_requested",
     "request_cancelled",
     "request_denied",
@@ -914,6 +946,8 @@ const ACTIVITY_KINDS: [&str; 19] = [
     "locked",
     "timer_set",
     "timer_rolled",
+    "timer_extended",
+    "timer_extension_rolled",
     "timer_paused",
     "timer_resumed",
     "timer_cleared",
@@ -990,6 +1024,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/keyholder/deny", post(kh_deny))
         .route("/api/keyholder/timer", post(kh_timer_set))
         .route("/api/keyholder/timer/roll", post(kh_timer_roll))
+        .route("/api/keyholder/timer/add", post(kh_timer_add))
+        .route("/api/keyholder/timer/add-roll", post(kh_timer_add_roll))
         .route("/api/keyholder/timer/pause", post(kh_timer_pause))
         .route("/api/keyholder/timer/resume", post(kh_timer_resume))
         .route("/api/keyholder/timer/clear", post(kh_timer_clear))
@@ -1163,6 +1199,8 @@ mod tests {
             ("POST", "/api/keyholder/deny"),
             ("POST", "/api/keyholder/timer"),
             ("POST", "/api/keyholder/timer/roll"),
+            ("POST", "/api/keyholder/timer/add"),
+            ("POST", "/api/keyholder/timer/add-roll"),
             ("POST", "/api/keyholder/timer/pause"),
             ("POST", "/api/keyholder/timer/resume"),
             ("POST", "/api/keyholder/timer/clear"),
@@ -1880,6 +1918,96 @@ mod tests {
         assert_eq!(r.status(), StatusCode::NOT_FOUND);
     }
 
+
+    // ---------- adding time to a timer ----------
+
+    #[tokio::test]
+    async fn the_keyholder_can_add_time_to_a_running_and_a_paused_timer_and_the_wearer_sees_it() {
+        let h = harness();
+        let kh = h.keyholder().await;
+        let w = h.wearer(&kh).await;
+
+        h.call("POST", "/api/keyholder/timer", Some(&kh), Some(json!({ "duration_secs": 3600 }))).await;
+        let (s, v) = h.call("POST", "/api/keyholder/timer/add", Some(&kh), Some(json!({ "duration_secs": 1800 }))).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["timer"]["remaining_ms"].as_i64().unwrap(), 90 * MIN);
+        let (_, ws) = h.call("GET", "/api/wearer/state", Some(&w), None).await;
+        assert_eq!(ws["timer"]["remaining_ms"].as_i64().unwrap(), 90 * MIN);
+
+        h.call("POST", "/api/keyholder/timer/pause", Some(&kh), None).await;
+        let (_, v) = h.call("POST", "/api/keyholder/timer/add", Some(&kh), Some(json!({ "duration_secs": 3600 }))).await;
+        assert_eq!((v["timer"]["kind"].as_str(), v["timer"]["remaining_ms"].as_i64()), (Some("paused"), Some(150 * MIN)));
+    }
+
+    #[tokio::test]
+    async fn a_random_extension_is_in_range_hidden_from_the_wearer_and_logged() {
+        let h = harness();
+        let kh = h.keyholder().await;
+        let w = h.wearer(&kh).await;
+        h.call("POST", "/api/keyholder/timer", Some(&kh), Some(json!({ "duration_secs": 7200 }))).await;
+
+        let (s, v) = h.call("POST", "/api/keyholder/timer/add-roll", Some(&kh), Some(json!({ "min_secs": 600, "max_secs": 1200 }))).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        let rolled = v["rolled_secs"].as_i64().unwrap();
+        assert!((600..=1200).contains(&rolled));
+        assert_eq!(v["timer"]["remaining_ms"].as_i64().unwrap(), 7_200_000 + rolled * 1000);
+
+        let (_, ws) = h.call("GET", "/api/wearer/state", Some(&w), None).await;
+        assert!(ws.get("rolled_secs").is_none());
+        let (_, act) = h.call("GET", "/api/wearer/activity", Some(&w), None).await;
+        let text = act.to_string();
+        assert!(text.contains("timer_extension_rolled"), "the wearer should see that time was added");
+        assert!(!text.contains("chosen_ms") && !text.contains(&rolled.to_string()), "but not how much: {text}");
+
+        let (_, a) = h.call("GET", "/api/keyholder/audit?limit=50", Some(&kh), None).await;
+        let entry = a["entries"].as_array().unwrap().iter().find(|e| e["kind"] == "timer_extension_rolled").unwrap();
+        assert_eq!((entry["detail"]["min_ms"].as_i64(), entry["detail"]["max_ms"].as_i64()), (Some(600_000), Some(1_200_000)));
+        assert_eq!(entry["detail"]["chosen_ms"].as_i64().unwrap(), rolled * 1000);
+    }
+
+    #[tokio::test]
+    async fn adding_time_validates_its_input_and_the_wearer_cannot_do_it() {
+        let h = harness();
+        let kh = h.keyholder().await;
+        let w = h.wearer(&kh).await;
+        h.call("POST", "/api/keyholder/timer", Some(&kh), Some(json!({ "duration_secs": 3600 }))).await;
+        for body in [json!({ "duration_secs": 0 }), json!({ "duration_secs": -5 }), json!({ "duration_secs": 400 * 86400 })] {
+            let (s, _) = h.call("POST", "/api/keyholder/timer/add", Some(&kh), Some(body)).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST);
+        }
+        // The total may not pass a year.
+        let (s, _) = h.call("POST", "/api/keyholder/timer/add", Some(&kh), Some(json!({ "duration_secs": 365 * 86400 }))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        let (s, _) = h.call("POST", "/api/keyholder/timer/add-roll", Some(&kh), Some(json!({ "min_secs": 10, "max_secs": 5 }))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+
+        let (s, _) = h.call("POST", "/api/keyholder/timer/add", Some(&w), Some(json!({ "duration_secs": 60 }))).await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        let (_, v) = h.call("GET", "/api/keyholder/state", Some(&kh), None).await;
+        assert_eq!(v["timer"]["remaining_ms"].as_i64().unwrap(), 3_600_000, "nothing above may have changed the timer");
+    }
+
+    #[tokio::test]
+    async fn adding_time_when_the_timer_has_ended_starts_a_new_one_and_the_wearer_is_told() {
+        let h = harness();
+        let kh = h.keyholder().await;
+        let w = h.wearer(&kh).await;
+        h.call("POST", "/api/wearer/push/subscribe", Some(&w), Some(good_subscription())).await;
+        let sender = FakeSender::default();
+        crate::push::notify_once(&h.state, &sender).await;
+
+        h.call("POST", "/api/keyholder/timer", Some(&kh), Some(json!({ "duration_secs": 60 }))).await;
+        h.advance(2 * MIN);
+        h.call("POST", "/api/wearer/request-unlock", Some(&w), None).await;
+        let (s, v) = h.call("POST", "/api/keyholder/timer/add", Some(&kh), Some(json!({ "duration_secs": 3600 }))).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!((v["timer"]["kind"].as_str(), v["lock"].as_str()), (Some("running"), Some("locked")), "the pending request is cancelled");
+
+        h.call("POST", "/api/keyholder/timer/add", Some(&kh), Some(json!({ "duration_secs": 600 }))).await;
+        crate::push::notify_once(&h.state, &sender).await;
+        let titles: Vec<String> = sender.sent().iter().map(|n| n["title"].as_str().unwrap().to_string()).collect();
+        assert!(titles.contains(&"Timer extended".to_string()), "{titles:?}");
+    }
 
     #[tokio::test]
     async fn oversized_bodies_are_rejected() {

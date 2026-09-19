@@ -135,5 +135,7 @@ test('a queued keyholder command is surfaced whatever the lock state', () => {
 test('activity wording names who did what', () => {
   assert.equal(describeActivity({ kind: 'unlocked', by: 'wearer', via: 'phone' }), 'You unlocked the pod from this phone');
   assert.equal(describeActivity({ kind: 'locked', by: 'keyholder', via: 'server' }), 'Your keyholder locked the pod');
+  assert.equal(describeActivity({ kind: 'timer_extended', by: 'keyholder' }), 'Time added to the timer by your keyholder');
+  assert.equal(describeActivity({ kind: 'timer_extension_rolled', by: 'keyholder' }), 'Time added to the timer by your keyholder');
   assert.equal(describeActivity({ kind: 'something_new', by: 'system' }), 'something new');
 });

@@ -151,6 +151,10 @@ enum TimerCmd {
     Set { duration: String },
     /// Start a timer of a random length between MIN and MAX (the wearer never sees the roll)
     Roll { min: String, max: String },
+    /// Add time to the running or paused timer, e.g. 2h. With no timer running it starts one.
+    Add { duration: String },
+    /// Add a random amount between MIN and MAX to the timer (the wearer never sees how much)
+    AddRoll { min: String, max: String },
     Pause,
     Resume,
     Clear,
@@ -403,6 +407,10 @@ async fn timer(cli: &Cli, auth: &PasswordArg, cmd: &TimerCmd) -> Result<()> {
         TimerCmd::Set { duration } => ("/api/keyholder/timer", Some(json!({ "duration_secs": parse_duration_secs(duration)? }))),
         TimerCmd::Roll { min, max } => {
             ("/api/keyholder/timer/roll", Some(json!({ "min_secs": parse_duration_secs(min)?, "max_secs": parse_duration_secs(max)? })))
+        }
+        TimerCmd::Add { duration } => ("/api/keyholder/timer/add", Some(json!({ "duration_secs": parse_duration_secs(duration)? }))),
+        TimerCmd::AddRoll { min, max } => {
+            ("/api/keyholder/timer/add-roll", Some(json!({ "min_secs": parse_duration_secs(min)?, "max_secs": parse_duration_secs(max)? })))
         }
         TimerCmd::Pause => ("/api/keyholder/timer/pause", None),
         TimerCmd::Resume => ("/api/keyholder/timer/resume", None),

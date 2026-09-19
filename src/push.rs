@@ -164,6 +164,7 @@ pub fn notification_for(kind: &str, actor: &str, message_body: Option<&str>) -> 
         "approval_expired" => note(kind, "Approval expired", "Ask again if you still need to unlock."),
         "timer_ended" => note(kind, "Timer finished", "You can ask to be unlocked now."),
         "timer_set" | "timer_rolled" => note("timer", "Timer started", "Your keyholder started a timer."),
+        "timer_extended" | "timer_extension_rolled" => note("timer", "Timer extended", "Your keyholder added time to the timer."),
         "timer_paused" => note("timer", "Timer paused", "Your keyholder paused the timer."),
         "timer_resumed" => note("timer", "Timer resumed", "Your keyholder restarted the timer."),
         "timer_cleared" => note("timer", "Timer cleared", "Your keyholder cleared the timer."),
@@ -374,6 +375,8 @@ mod tests {
         }
         assert!(notification_for("unlocked", "wearer", None).is_none());
         assert!(notification_for("unlocked", "keyholder", None).is_some());
+        assert_eq!(notification_for("timer_extended", "keyholder", None).unwrap().title, "Timer extended");
+        assert_eq!(notification_for("timer_extension_rolled", "keyholder", None).unwrap().body, "Your keyholder added time to the timer.");
         // Timer changes share one tag, so they replace each other rather than stack.
         assert_eq!(notification_for("timer_paused", "keyholder", None).unwrap().tag, notification_for("timer_set", "keyholder", None).unwrap().tag);
     }

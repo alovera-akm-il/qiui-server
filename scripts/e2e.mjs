@@ -160,6 +160,14 @@ console.log('Flow A: server in range');
   await shot(page, 'app-timer-paused');
   step('a paused timer still blocks, with its own wording');
 
+  // The keyholder adds a day to the paused timer: the wearer's countdown grows by a day.
+  const pausedDays = Number(await page.locator('[data-live="d"]').innerText());
+  await server.k('POST', '/timer/add', { duration_secs: 86400 });
+  await page.getByRole('button', { name: 'Sync now' }).click();
+  await page.waitForFunction((d) => Number(document.querySelector('[data-live="d"]')?.textContent) === d, pausedDays + 1);
+  await page.getByText('Paused', { exact: true }).waitFor();
+  step('adding a day to the timer shows in the wearer\'s countdown, and it stays paused');
+
   await server.k('POST', '/timer/clear');
   await page.getByRole('button', { name: 'Sync now' }).click();
   await button(page, 'Request unlock').waitFor();

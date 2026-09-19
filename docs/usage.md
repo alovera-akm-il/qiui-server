@@ -151,6 +151,8 @@ Every command below signs in for you. Give the password with `QIUI_KEYHOLDER_PAS
 | `sync` | Reach the pod over Bluetooth and refresh "last reached" |
 | `timer set <duration>` | Start a timer of an exact length: `14d`, `36h`, `2d12h30m`, `90m` |
 | `timer roll <min> <max>` | Start a timer of random length in that range. The wearer never sees the range or the roll |
+| `timer add <duration>` | Add time to the running or paused timer, e.g. `2h`. With no active timer it starts one |
+| `timer add-roll <min> <max>` | Add a random amount in that range. The wearer never sees how much |
 | `timer pause` / `resume` / `clear` | Freeze, restart or remove the timer |
 | `queue lock` / `queue unlock` / `queue cancel` | Have a command carried out the next time the pod can be reached |
 | `message "text"` | Send the wearer a message (up to 1000 characters) |
@@ -167,6 +169,9 @@ the same rules. That is your fallback if the server is down. The other commands 
 - A timer counts down on the **server's clock**, so changing the phone's clock does nothing.
 - **While a timer is running or paused, nobody unlocks**, you included. Pausing is not enough: to unlock you must
   `timer clear` first.
+- **Adding time** (`timer add`, `timer add-roll`) makes a running timer end later, or gives a paused timer more time
+  while leaving it paused. A timer cannot be made longer than 365 days in total. If there is no active timer (none,
+  or one that has ended), `add` simply starts a new one, exactly like `timer set`.
 - Starting a timer **cancels a pending request or approval**, because they were granted under different rules.
   You can see this in the demo above (`approval_revoked`).
 - When the timer ends, the wearer's **Request unlock** button reopens. They still need your approval.
@@ -290,7 +295,7 @@ the server.
 ### Messages, activity and queued commands
 
 The **Messages** tab shows what the keyholder has sent. **Activity** tells the story of your lock: requests,
-approvals, timer changes, unlocks and locks, and who did each. It never shows how a random timer was rolled. If the
+approvals, timer changes (including time being added), unlocks and locks, and who did each. It never shows how a random timer was rolled, or how much time was added. If the
 keyholder queued a lock or unlock while you were out of range, a card offers **Connect and apply**.
 
 <p>
@@ -303,7 +308,7 @@ keyholder queued a lock or unlock while you were out of range, a card offers **C
 
 When the server has notifications set up, the app offers **Turn on notifications**. You are then told when your
 keyholder approves or turns down a request, sends a message (the text is shown, so it can appear on your lock
-screen), starts, pauses or clears a timer, or queues a command, and when a timer finishes. Things you did yourself
+screen), starts, extends, pauses or clears a timer, or queues a command, and when a timer finishes. Things you did yourself
 are never notified.
 
 <img src="images/app-notifications.png" alt="The notifications offer" width="200">
@@ -399,6 +404,8 @@ response carries `Cache-Control: no-store`. Authenticate with `Authorization: Be
 | `sync` | POST | | Refresh pod info over Bluetooth (`in_range` false is a normal answer) |
 | `timer` | POST | `{"duration_secs"}` | Exact timer |
 | `timer/roll` | POST | `{"min_secs","max_secs"}` | Random timer; the response adds `rolled_secs` |
+| `timer/add` | POST | `{"duration_secs"}` | Add time; starts a timer if none is active. Refused past 365 days in total |
+| `timer/add-roll` | POST | `{"min_secs","max_secs"}` | Add a random amount; the response adds `rolled_secs` |
 | `timer/pause`, `timer/resume`, `timer/clear` | POST | | |
 | `queue` | POST | `{"command": "lock"\|"unlock"}` | Queue a command |
 | `queue/cancel` | POST | | |

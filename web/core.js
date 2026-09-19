@@ -184,6 +184,8 @@ export function describeActivity(e) {
     case 'locked': return `${who} locked the pod${via}`;
     case 'timer_set': return 'Timer set by your keyholder';
     case 'timer_rolled': return 'Random timer rolled by your keyholder';
+    case 'timer_extended':
+    case 'timer_extension_rolled': return 'Time added to the timer by your keyholder';
     case 'timer_paused': return 'Timer paused by your keyholder';
     case 'timer_resumed': return 'Timer restarted by your keyholder';
     case 'timer_cleared': return 'Timer cleared by your keyholder';
