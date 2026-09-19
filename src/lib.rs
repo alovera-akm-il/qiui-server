@@ -6,6 +6,7 @@ pub mod client;
 pub mod cloud;
 pub mod datadir;
 pub mod hardware;
+pub mod hashgate;
 pub mod machine;
 pub mod pod;
 pub mod push;

@@ -30,7 +30,7 @@ cargo build --release
 qiui-server init                          # keyholder password + recovery PIN
 qiui-server config set-client-id          # your QIUI client id (stored encrypted)
 qiui-server config set-mac E5:26:D6:6E:B6:8A
-qiui-server serve                         # http://127.0.0.1:8443; put HTTPS in front for phones
+qiui-server serve                         # http://0.0.0.0:8443 (all interfaces, plain HTTP); use an HTTPS front for remote access
 qiui-server pairing-code                  # one-time code for the wearer's phone
 qiui-server status                        # then: approve, timer set 14d, queue lock, audit …
 ```
@@ -51,7 +51,7 @@ qiui-server init
 qiui-server serve --simulate-pod          # a pretend pod that is always in range
 ```
 
-Open http://127.0.0.1:8443 in a browser, pair with `qiui-server pairing-code`, and drive the other side with the
+Open http://127.0.0.1:8443 in a browser (or this machine's LAN address), pair with `qiui-server pairing-code`, and drive the other side with the
 keyholder commands. Nothing touches QIUI or real hardware.
 
 ## Status

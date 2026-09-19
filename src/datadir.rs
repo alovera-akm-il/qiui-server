@@ -128,6 +128,20 @@ pub fn reseal_config(root: &Path, auth: &Auth, old_password: &str, new_password:
     Ok(true)
 }
 
+/// Re-seal the credentials under the current key settings if they were sealed under older ones.
+/// Returns true if anything was rewritten. Needs the keyholder's password, so it runs at sign-in.
+pub fn upgrade_sealed(root: &Path, auth: &Auth, password: &str) -> Result<bool> {
+    let mut cfg = load_config(root)?;
+    let Some(sealed) = &cfg.secrets else { return Ok(false) };
+    if !sealed.needs_upgrade(auth) {
+        return Ok(false);
+    }
+    let secrets = secrets::open(auth, password, sealed)?;
+    cfg.seal_secrets(auth, password, &secrets)?;
+    save_config(root, &cfg)?;
+    Ok(true)
+}
+
 /// Drop the sealed credentials (after a PIN reset they cannot be opened any more).
 /// Returns false if there was nothing sealed.
 pub fn clear_sealed(root: &Path) -> Result<bool> {
@@ -159,7 +173,6 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("qiui-datadir-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let (_store, auth) = open(&dir).unwrap();
-        let hash = auth.hash_secret("a long enough secret").unwrap();
         drop(_store);
 
         for f in ["pepper.key", "qiui.db"] {
@@ -168,9 +181,9 @@ mod tests {
         }
         assert_eq!(fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
 
-        // A second open must load the same pepper, so old hashes still verify.
+        // A second open must load the same pepper, so hashes made under it still verify.
         let (_s2, auth2) = open(&dir).unwrap();
-        assert!(auth2.verify_secret("a long enough secret", &hash));
+        assert!(auth2.same_pepper_as(&auth));
 
         // A pepper readable by others is refused.
         fs::set_permissions(dir.join("pepper.key"), fs::Permissions::from_mode(0o644)).unwrap();

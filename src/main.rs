@@ -100,13 +100,10 @@ enum Action {
     },
 
     // ----- server and account administration (local shell) -----
-    /// Run the HTTP API
+    /// Run the HTTP API and the wearer's app. Listens on every network interface by default, in plain HTTP.
     Serve {
-        #[arg(long, default_value = "127.0.0.1:8443")]
+        #[arg(long, default_value = "0.0.0.0:8443")]
         bind: SocketAddr,
-        /// Allow binding a non-loopback address. The server speaks plain HTTP; put it behind TLS (e.g. `tailscale serve`).
-        #[arg(long)]
-        allow_remote: bool,
         /// DEMO ONLY: pretend the pod is always in range and obeys. No QIUI account or hardware is used.
         #[arg(long)]
         simulate_pod: bool,
@@ -203,6 +200,12 @@ enum ConfigCmd {
         #[command(flatten)]
         auth: PasswordArg,
     },
+    /// How many wearer devices may be paired at once (1 to 5; the default is 2)
+    SetMaxDevices {
+        count: i64,
+        #[command(flatten)]
+        auth: PasswordArg,
+    },
     /// Import QIUI_CLIENT_ID / QIUI_PROD_API_KEY from an old .qiui_pod_env file (stored encrypted)
     ImportEnv {
         path: Option<PathBuf>,
@@ -234,9 +237,7 @@ async fn main() -> Result<()> {
         }
         Action::Audit { limit, auth } => audit(&cli, auth, *limit).await,
         Action::Queue { cmd, auth } => queue(&cli, auth, cmd).await,
-        Action::Serve { bind, allow_remote, simulate_pod, simulate_out_of_range } => {
-            serve(&cli, *bind, *allow_remote, *simulate_pod, !*simulate_out_of_range).await
-        }
+        Action::Serve { bind, simulate_pod, simulate_out_of_range } => serve(&cli, *bind, *simulate_pod, !*simulate_out_of_range).await,
         Action::Init { password, pin } => init(&cli, password.clone(), pin.clone()),
         Action::ResetPassword { pin, new_password } => reset_password(&cli, pin.clone(), new_password.clone()),
         Action::PairingCode(a) => pairing_code(&cli, a),
@@ -289,6 +290,11 @@ fn prompt_twice(what: &str) -> Result<String> {
 
 // ---------- talking to the running server ----------
 
+/// The server answered, but is too busy checking passwords to take another sign-in right now.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct ServerBusy(String);
+
 struct Server {
     base: String,
     http: reqwest::Client,
@@ -312,7 +318,11 @@ impl Server {
         let status = resp.status();
         let body: Value = resp.json().await.unwrap_or(Value::Null);
         if !status.is_success() {
-            bail!("{}", body["error"].as_str().unwrap_or("sign-in failed"));
+            let message = body["error"].as_str().unwrap_or("sign-in failed").to_string();
+            if body["code"] == "busy" {
+                return Err(ServerBusy(message).into());
+            }
+            bail!("{message}");
         }
         let token = body["token"].as_str().context("the server returned no token")?.to_string();
         Ok(Some(Server { base, http, token }))
@@ -385,7 +395,7 @@ fn show_state(v: &Value) -> Result<()> {
         Some(t) => println!("Pod       last reached {} via {}", ago(now, t), v["pod"]["via"].as_str().unwrap_or("?")),
         None => println!("Pod       not reached yet; run `qiui-server sync`"),
     }
-    if let Some(d) = v.get("paired_device").filter(|d| !d.is_null()) {
+    for d in v["paired_devices"].as_array().into_iter().flatten() {
         let seen = d["last_seen_ms"].as_i64().map(|t| ago(now, t)).unwrap_or_else(|| "never".into());
         println!("Wearer    {} (last seen {seen})", d["name"].as_str().unwrap_or("?"));
     }
@@ -463,6 +473,16 @@ async fn audit(cli: &Cli, auth: &PasswordArg, limit: u32) -> Result<()> {
     if v["chain_intact"] != true {
         println!("WARNING: the audit log's hash chain is broken: it has been altered.\n");
     }
+    // Failed attempts folded into the next row: shown here at once, so a burst is never hidden.
+    for p in v["pending_failures"].as_array().into_iter().flatten() {
+        let since = p["since_ms"].as_i64().map(fmt_local).unwrap_or_default();
+        println!(
+            "        pending  {:<10} {:<24} +{} more since {since} (summary row follows within about 35 s)",
+            p["actor"].as_str().unwrap_or("?"),
+            p["kind"].as_str().unwrap_or("?"),
+            p["count"]
+        );
+    }
     for e in v["entries"].as_array().into_iter().flatten() {
         let detail = if e["detail"].as_object().is_some_and(|o| !o.is_empty()) { e["detail"].to_string() } else { String::new() };
         println!("{}  {:<10} {:<24} {detail}", fmt_local(e["ts_ms"].as_i64().unwrap_or(0)), e["actor"].as_str().unwrap_or("?"), e["kind"].as_str().unwrap_or("?"));
@@ -472,17 +492,28 @@ async fn audit(cli: &Cli, auth: &PasswordArg, limit: u32) -> Result<()> {
 
 /// lock / unlock / sync: through the server if it is running, else directly over Bluetooth.
 async fn pod_action(cli: &Cli, auth: &PasswordArg, what: &str) -> Result<()> {
-    if let Some(srv) = Server::connect(cli, auth).await? {
-        let out = srv.call(Method::POST, &format!("/api/keyholder/{what}"), None).await;
-        let _ = srv.call(Method::POST, "/api/keyholder/logout", None).await;
-        let v = out?;
-        if what == "sync" && v["in_range"] == false {
-            println!("The pod is not within range of the server.");
+    match Server::connect(cli, auth).await {
+        Ok(Some(srv)) => {
+            let out = srv.call(Method::POST, &format!("/api/keyholder/{what}"), None).await;
+            let _ = srv.call(Method::POST, "/api/keyholder/logout", None).await;
+            let v = out?;
+            if what == "sync" && v["in_range"] == false {
+                println!("The pod is not within range of the server.");
+            }
+            show_state(&v)
         }
-        return show_state(&v);
+        Ok(None) => {
+            eprintln!("(server not running at {}; talking to the pod directly)", cli.server);
+            direct(cli, auth, what).await
+        }
+        // A flood of guesses can crowd out sign-ins over the network. Lock, unlock and sync must still work
+        // from this machine, so go to the pod directly (with the same password check and the same rules).
+        Err(e) if e.downcast_ref::<ServerBusy>().is_some() => {
+            eprintln!("(the server is busy checking passwords; talking to the pod directly)");
+            direct(cli, auth, what).await
+        }
+        Err(e) => Err(e),
     }
-    eprintln!("(server not running at {}; talking to the pod directly)", cli.server);
-    direct(cli, auth, what).await
 }
 
 // ---------- direct pod control, with the same rules as the API ----------
@@ -704,6 +735,8 @@ fn config(cli: &Cli, cmd: &ConfigCmd) -> Result<()> {
             println!("QIUI credentials  {credentials}");
             println!("Pod address       {}", cfg.mac.as_deref().unwrap_or("not set (using the built-in default)"));
             println!("Push contact      {}", cfg.push_contact.as_deref().unwrap_or("not set (using a placeholder)"));
+            let (store, _) = open_store(cli)?;
+            println!("Paired devices    up to {}", accounts::max_devices(store.connection())?);
             Ok(())
         }
         ConfigCmd::SetMac { mac, auth } => {
@@ -715,6 +748,13 @@ fn config(cli: &Cli, cmd: &ConfigCmd) -> Result<()> {
             require_keyholder(cli, auth)?;
             cfg.push_contact = Some(contact.trim().to_string());
             save_plain(&root, &cfg)
+        }
+        ConfigCmd::SetMaxDevices { count, auth } => {
+            let (store, _) = require_keyholder(cli, auth)?;
+            accounts::set_max_devices(store.connection(), *count)?;
+            store.log(system_now_ms(), "local-cli", "max_devices_changed", &json!({ "max": count }))?;
+            println!("Up to {count} wearer device(s) may now be paired. Takes effect immediately.");
+            Ok(())
         }
         ConfigCmd::SetClientId { value, auth } => {
             let id = secret(value.clone(), "QIUI client id: ")?.trim().to_string();
@@ -768,10 +808,7 @@ fn seal_credentials(cli: &Cli, root: &std::path::Path, cfg: &mut Config, auth: &
 
 // ---------- server ----------
 
-async fn serve(cli: &Cli, bind: SocketAddr, allow_remote: bool, simulate: bool, sim_in_range: bool) -> Result<()> {
-    if !bind.ip().is_loopback() && !allow_remote {
-        bail!("{bind} is not a loopback address and this server speaks plain HTTP. Bind 127.0.0.1 behind TLS (e.g. `tailscale serve`), or pass --allow-remote if you know what you are doing.");
-    }
+async fn serve(cli: &Cli, bind: SocketAddr, simulate: bool, sim_in_range: bool) -> Result<()> {
     let (store, auth) = open_store(cli)?;
     if !accounts::is_initialised(store.connection())? {
         eprintln!("Note: no keyholder account yet. Run `qiui-server init` first.");
@@ -818,6 +855,15 @@ async fn serve(cli: &Cli, bind: SocketAddr, allow_remote: bool, simulate: bool, 
         }
     });
 
+    // Write the summary row for a burst of failed attempts as soon as its window closes.
+    let failure_state = state.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            api::flush_failure_summaries(&failure_state).await;
+        }
+    });
+
     // Carry out the keyholder's queued command as soon as the pod is in range.
     let queue_state = state.clone();
     tokio::spawn(async move {
@@ -856,6 +902,13 @@ async fn serve(cli: &Cli, bind: SocketAddr, allow_remote: bool, simulate: bool, 
 
     let listener = tokio::net::TcpListener::bind(bind).await.with_context(|| format!("binding {bind}"))?;
     println!("Listening on http://{bind} for pod {mac}  (Ctrl-C to stop)");
+    if !bind.ip().is_loopback() {
+        // Plain HTTP on more than this machine: say so, once, where it will be seen.
+        eprintln!(
+            "Note: {bind} is plain HTTP, reachable from {}. Passwords and tokens are not encrypted on that path; use an HTTPS front (your Tailscale address) for anything remote.",
+            if bind.ip().is_unspecified() { "every network interface (LAN and Tailscale)" } else { "that address" }
+        );
+    }
     println!("The wearer's app is served at the same address.");
     axum::serve(listener, api::router(state))
         .with_graceful_shutdown(async {
@@ -896,7 +949,7 @@ mod tests {
                 Action::Timer { auth, .. } | Action::Queue { auth, .. } => auth.password,
                 Action::Config { cmd } => match cmd {
                     ConfigCmd::SetClientId { auth, .. } | ConfigCmd::SetApiKey { auth, .. } | ConfigCmd::ImportEnv { auth, .. } | ConfigCmd::Encrypt(auth) => auth.password,
-                    ConfigCmd::Show(auth) | ConfigCmd::SetMac { auth, .. } | ConfigCmd::SetPushContact { auth, .. } => auth.password,
+                    ConfigCmd::Show(auth) | ConfigCmd::SetMac { auth, .. } | ConfigCmd::SetPushContact { auth, .. } | ConfigCmd::SetMaxDevices { auth, .. } => auth.password,
                 },
                 _ => panic!("{args:?}: not a command with a password"),
             }
@@ -908,7 +961,7 @@ mod tests {
             &["message", "hello"], &["audit"], &["audit", "--limit", "5"],
             &["queue", "lock"], &["queue", "unlock"], &["queue", "cancel"],
             &["pairing-code"], &["devices"], &["revoke-device", "3"],
-            &["config", "show"], &["config", "set-mac", "AA:BB"], &["config", "set-push-contact", "mailto:a@b.c"],
+            &["config", "show"], &["config", "set-mac", "AA:BB"], &["config", "set-push-contact", "mailto:a@b.c"], &["config", "set-max-devices", "2"],
             &["config", "set-client-id", "Client_x"], &["config", "set-api-key", "key"], &["config", "import-env"], &["config", "encrypt"],
         ];
         for base in with_flag {

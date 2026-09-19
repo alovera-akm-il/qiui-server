@@ -34,7 +34,7 @@ pub enum AuthError {
     Invalid,
     #[error("{0}")]
     Weak(&'static str),
-    #[error("a wearer device is already paired; revoke it first")]
+    #[error("the limit of paired devices has been reached; revoke one first")]
     DeviceAlreadyPaired,
     #[error("database error: {0}")]
     Db(#[from] rusqlite::Error),
@@ -46,41 +46,120 @@ pub type Result<T> = std::result::Result<T, AuthError>;
 
 // ---------- hashing and randomness ----------
 
+/// Argon2id cost, for every password, PIN and key derivation. Measured on an 8-core i7 in an optimised
+/// build: about 230 ms a hash. With no lockout, this is the brake on guessing, so it is deliberately slow.
+/// Re-measure on other hardware with `cargo run --release --example argon_bench`.
+///
+/// Memory and passes are what cost a guesser. Lanes are not: without threads, more lanes take the
+/// same time, so they stay at 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KdfParams {
+    /// Memory, in KiB.
+    pub m: u32,
+    /// Passes over that memory.
+    pub t: u32,
+    pub p: u32,
+}
+
+impl KdfParams {
+    pub const CURRENT: Self = Self { m: 128 * 1024, t: 3, p: 1 };
+    /// What earlier versions used. Needed to open credentials sealed before the settings were recorded.
+    pub const LEGACY: Self = Self { m: 19 * 1024, t: 2, p: 1 };
+
+    fn argon_params(self) -> Result<Params> {
+        Params::new(self.m, self.t, self.p, Some(32)).map_err(|_| AuthError::Internal)
+    }
+
+    /// Settings read from a file are not trusted: refuse absurd ones rather than allocate them.
+    pub fn is_reasonable(self) -> bool {
+        (8..=1024 * 1024).contains(&self.m) && (1..=20).contains(&self.t) && (1..=8).contains(&self.p)
+    }
+
+    /// The settings a PHC string was made with (`$argon2id$v=19$m=…,t=…,p=…$salt$hash`).
+    pub fn from_phc(phc: &str) -> Option<Self> {
+        let field = phc.split('$').nth(3)?;
+        let mut m = None;
+        let (mut t, mut p) = (None, None);
+        for kv in field.split(',') {
+            let (k, v) = kv.split_once('=')?;
+            match k {
+                "m" => m = v.parse().ok(),
+                "t" => t = v.parse().ok(),
+                "p" => p = v.parse().ok(),
+                _ => {}
+            }
+        }
+        Some(Self { m: m?, t: t?, p: p? })
+    }
+}
+
+/// Shortest keyholder password accepted when one is set or changed.
+pub const MIN_PASSWORD_CHARS: usize = 16;
+
 pub struct Auth {
     pepper: Vec<u8>,
-    params: Params,
+    kdf: KdfParams,
 }
 
 impl Auth {
     pub fn new(pepper: Vec<u8>) -> Self {
-        Self { pepper, params: Params::default() }
+        Self { pepper, kdf: KdfParams::CURRENT }
+    }
+
+    pub fn with_params(pepper: Vec<u8>, kdf: KdfParams) -> Self {
+        Self { pepper, kdf }
     }
 
     /// Cheap parameters so the test suite stays fast. Never used outside tests.
     #[cfg(test)]
     pub fn for_tests(pepper: &[u8]) -> Self {
-        Self { pepper: pepper.to_vec(), params: Params::new(8, 1, 1, None).expect("valid test params") }
+        Self { pepper: pepper.to_vec(), kdf: KdfParams { m: 8, t: 1, p: 1 } }
+    }
+
+    /// Tests only: are these two loaded with the same pepper? (Cheaper than hashing something with each.)
+    #[cfg(test)]
+    pub fn same_pepper_as(&self, other: &Auth) -> bool {
+        self.pepper == other.pepper
+    }
+
+    /// The settings new hashes and keys are made with.
+    pub fn params(&self) -> KdfParams {
+        self.kdf
+    }
+
+    fn argon_with(&self, kdf: KdfParams) -> Result<Argon2<'_>> {
+        Argon2::new_with_secret(&self.pepper, Algorithm::Argon2id, Version::V0x13, kdf.argon_params()?).map_err(|_| AuthError::Internal)
     }
 
     fn argon(&self) -> Argon2<'_> {
-        Argon2::new_with_secret(&self.pepper, Algorithm::Argon2id, Version::V0x13, self.params.clone())
-            .expect("pepper and params are valid")
+        self.argon_with(self.kdf).expect("pepper and params are valid")
     }
 
     pub fn hash_secret(&self, secret: &str) -> Result<String> {
         self.argon().hash_password(secret.as_bytes()).map(|h| h.to_string()).map_err(|_| AuthError::Internal)
     }
 
-    /// A 32-byte key from a secret: Argon2id keyed with the pepper, so a copy of anything sealed with it
-    /// is useless without both the password and `pepper.key`.
+    /// A 32-byte key from a secret, under the current settings.
     pub fn derive_key(&self, secret: &str, salt: &[u8]) -> Result<[u8; 32]> {
+        self.derive_key_with(secret, salt, self.kdf)
+    }
+
+    /// A 32-byte key under the given settings (those recorded with something sealed earlier): Argon2id keyed
+    /// with the pepper, so a copy of anything sealed with it is useless without both the password and `pepper.key`.
+    pub fn derive_key_with(&self, secret: &str, salt: &[u8], kdf: KdfParams) -> Result<[u8; 32]> {
         let mut key = [0u8; 32];
-        self.argon().hash_password_into(secret.as_bytes(), salt, &mut key).map_err(|_| AuthError::Internal)?;
+        self.argon_with(kdf)?.hash_password_into(secret.as_bytes(), salt, &mut key).map_err(|_| AuthError::Internal)?;
         Ok(key)
     }
 
     pub fn verify_secret(&self, secret: &str, phc: &str) -> bool {
+        // The settings come from the hash itself, so hashes made under older settings still verify.
         PasswordVerifier::<str>::verify_password(&self.argon(), secret.as_bytes(), phc).is_ok()
+    }
+
+    /// True if this hash was made under weaker (or different) settings than are current now.
+    pub fn needs_rehash(&self, phc: &str) -> bool {
+        KdfParams::from_phc(phc) != Some(self.kdf)
     }
 }
 
@@ -119,6 +198,10 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             id INTEGER PRIMARY KEY CHECK (id = 1),
             password_hash TEXT NOT NULL,
             pin_hash TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS failure_log (
             kind TEXT PRIMARY KEY,
@@ -183,11 +266,67 @@ pub fn note_failure(conn: &Connection, kind: &str, now_ms: i64) -> rusqlite::Res
     }
 }
 
+/// Failures folded into the next audit row that have not been written yet. They are shown to the keyholder
+/// at once, so summarising never hides a burst of guesses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingFailure {
+    pub actor: String,
+    pub kind: String,
+    pub count: i64,
+    /// When the last row for this kind of failure was written: the start of the count.
+    pub since_ms: i64,
+}
+
+pub fn pending_failures(conn: &Connection) -> rusqlite::Result<Vec<PendingFailure>> {
+    let mut stmt = conn.prepare("SELECT kind, last_logged_ms, suppressed FROM failure_log WHERE suppressed > 0 ORDER BY last_logged_ms")?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(key, since_ms, count)| {
+            let (actor, kind) = key.split_once(':')?;
+            Some(PendingFailure { actor: actor.to_string(), kind: kind.to_string(), count, since_ms })
+        })
+        .collect())
+}
+
+/// Add to a route's pending count without writing a row (used for attempts turned away while busy, which are
+/// counted in memory and folded in here every few seconds).
+pub fn add_pending_failures(conn: &Connection, key: &str, n: i64, now_ms: i64) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO failure_log (kind, last_logged_ms, suppressed) VALUES (?1, ?2, ?3)
+         ON CONFLICT(kind) DO UPDATE SET suppressed = suppressed + ?3",
+        params![key, now_ms, n],
+    )?;
+    Ok(())
+}
+
+/// When the last row for this route's failures was written (the start of its pending count).
+pub fn failure_window_start(conn: &Connection, key: &str) -> rusqlite::Result<Option<i64>> {
+    conn.query_row("SELECT last_logged_ms FROM failure_log WHERE kind = ?1", [key], |r| r.get(0)).optional()
+}
+
+/// Counts whose window has closed and that have not been written: take them (for a summary row) and
+/// reset them. The window start is left alone, so the next failure after this is a new window's first
+/// and gets its own row.
+pub fn take_due_failures(conn: &Connection, now_ms: i64) -> rusqlite::Result<Vec<PendingFailure>> {
+    let due: Vec<PendingFailure> = pending_failures(conn)?
+        .into_iter()
+        .filter(|p| now_ms < p.since_ms || now_ms - p.since_ms >= FAILURE_LOG_WINDOW_MS)
+        .collect();
+    for p in &due {
+        conn.execute("UPDATE failure_log SET suppressed = 0 WHERE kind = ?1", [format!("{}:{}", p.actor, p.kind)])?;
+    }
+    Ok(due)
+}
+
 // ---------- keyholder ----------
 
-fn check_password(password: &str) -> Result<()> {
-    if password.chars().count() < 10 {
-        return Err(AuthError::Weak("password must be at least 10 characters"));
+/// The rule for a new keyholder password. A long passphrase, because nothing limits guessing.
+pub fn check_password(password: &str) -> Result<()> {
+    if password.chars().count() < MIN_PASSWORD_CHARS {
+        return Err(AuthError::Weak("password must be at least 16 characters (a long passphrase is easiest)"));
     }
     Ok(())
 }
@@ -222,21 +361,50 @@ fn load_hashes(conn: &Connection) -> Result<(String, String)> {
         .ok_or(AuthError::NotInitialised)
 }
 
+/// The stored password hash, for a caller that wants to check it away from the database lock.
+pub fn stored_password_hash(conn: &Connection) -> Result<String> {
+    Ok(load_hashes(conn)?.0)
+}
+
 /// Check the keyholder password. A wrong one is refused, and that is all: there is no lockout.
+/// A right one also brings a hash made under older settings up to the current ones.
 pub fn verify_password(conn: &Connection, auth: &Auth, password: &str) -> Result<()> {
     let (hash, _) = load_hashes(conn)?;
-    if auth.verify_secret(password, &hash) { Ok(()) } else { Err(AuthError::Invalid) }
+    if !auth.verify_secret(password, &hash) {
+        return Err(AuthError::Invalid);
+    }
+    if auth.needs_rehash(&hash) {
+        upgrade_password_hash(conn, &auth.hash_secret(password)?)?;
+    }
+    Ok(())
+}
+
+/// Store a stronger hash of the same password. Sessions are untouched: nothing about the password changed.
+pub fn upgrade_password_hash(conn: &Connection, new_hash: &str) -> Result<()> {
+    conn.execute("UPDATE keyholder SET password_hash = ?1 WHERE id = 1", [new_hash])?;
+    Ok(())
+}
+
+/// A new keyholder session, once the password has been checked.
+pub fn start_keyholder_session(conn: &Connection, now_ms: i64) -> Result<String> {
+    create_session(conn, Role::Keyholder, None, now_ms, KEYHOLDER_SESSION_MS)
 }
 
 pub fn login(conn: &Connection, auth: &Auth, password: &str, now_ms: i64) -> Result<String> {
     verify_password(conn, auth, password)?;
-    create_session(conn, Role::Keyholder, None, now_ms, KEYHOLDER_SESSION_MS)
+    start_keyholder_session(conn, now_ms)
 }
 
 pub fn change_password(conn: &Connection, auth: &Auth, current: &str, new: &str, now_ms: i64) -> Result<()> {
     check_password(new)?;
     verify_password(conn, auth, current)?;
     set_password(conn, auth, new, now_ms)
+}
+
+/// Replace the password hash (already computed) and sign every keyholder session out.
+pub fn replace_password_hash(conn: &Connection, new_hash: &str, now_ms: i64) -> Result<()> {
+    upgrade_password_hash(conn, new_hash)?;
+    revoke_sessions(conn, Role::Keyholder, now_ms)
 }
 
 /// Local recovery: the recovery PIN authorises a new password.
@@ -250,8 +418,7 @@ pub fn reset_password_with_pin(conn: &Connection, auth: &Auth, pin: &str, new: &
 }
 
 fn set_password(conn: &Connection, auth: &Auth, new: &str, now_ms: i64) -> Result<()> {
-    conn.execute("UPDATE keyholder SET password_hash = ?1 WHERE id = 1", [auth.hash_secret(new)?])?;
-    revoke_sessions(conn, Role::Keyholder, now_ms)
+    replace_password_hash(conn, &auth.hash_secret(new)?, now_ms)
 }
 
 // ---------- sessions ----------
@@ -350,11 +517,33 @@ pub fn create_pairing_code(conn: &Connection, now_ms: i64) -> Result<String> {
     Ok(format!("{}-{}", &raw[..4], &raw[4..]))
 }
 
-fn active_device_exists(conn: &Connection) -> Result<bool> {
-    Ok(conn.query_row("SELECT COUNT(*) FROM devices WHERE revoked_ms IS NULL", [], |r| r.get::<_, i64>(0))? > 0)
+/// How many wearer devices may be paired at once. The default is two, so one phone can be paired on each of
+/// two addresses (each address is a separate app to the browser). The keyholder controls it, and every pairing
+/// still needs a code from the keyholder.
+pub const DEFAULT_MAX_DEVICES: i64 = 2;
+pub const MAX_DEVICES_LIMIT: i64 = 5;
+
+pub fn max_devices(conn: &Connection) -> Result<i64> {
+    let stored: Option<String> = conn.query_row("SELECT value FROM settings WHERE key = 'max_devices'", [], |r| r.get(0)).optional()?;
+    Ok(stored.and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_MAX_DEVICES))
 }
 
-/// Exchange a pairing code for a long-lived device token. One active device at a time.
+pub fn set_max_devices(conn: &Connection, n: i64) -> Result<()> {
+    if !(1..=MAX_DEVICES_LIMIT).contains(&n) {
+        return Err(AuthError::Weak("the device limit must be between 1 and 5"));
+    }
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES ('max_devices', ?1) ON CONFLICT(key) DO UPDATE SET value = ?1",
+        [n.to_string()],
+    )?;
+    Ok(())
+}
+
+fn active_device_count(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row("SELECT COUNT(*) FROM devices WHERE revoked_ms IS NULL", [], |r| r.get::<_, i64>(0))?)
+}
+
+/// Exchange a pairing code for a long-lived device token, up to the device limit.
 pub fn pair_device(conn: &Connection, code: &str, device_name: &str, now_ms: i64) -> Result<String> {
     let name = device_name.trim();
     let name = if name.is_empty() { "wearer device" } else { name };
@@ -373,7 +562,7 @@ pub fn pair_device(conn: &Connection, code: &str, device_name: &str, now_ms: i64
     if !valid {
         return Err(AuthError::Invalid);
     }
-    if active_device_exists(conn)? {
+    if active_device_count(conn)? >= max_devices(conn)? {
         return Err(AuthError::DeviceAlreadyPaired);
     }
     let c = normalise_code(code).ok_or(AuthError::Internal)?;
@@ -547,6 +736,31 @@ mod tests {
     }
 
     #[test]
+    fn folded_in_failures_are_visible_at_once_and_become_a_row_when_the_window_closes() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        assert_eq!(note_failure(&conn, "system:login_failed", 1_000).unwrap(), Some(0)); // its own row, now
+        for t in [2_000, 3_000, 4_000] {
+            assert_eq!(note_failure(&conn, "system:login_failed", t).unwrap(), None);
+        }
+        // The three are visible immediately, with when the count began, though no row exists for them yet.
+        let pending = pending_failures(&conn).unwrap();
+        assert_eq!(pending, [PendingFailure { actor: "system".into(), kind: "login_failed".into(), count: 3, since_ms: 1_000 }]);
+
+        // Not due while the window is open...
+        assert!(take_due_failures(&conn, 20_000).unwrap().is_empty());
+        assert_eq!(pending_failures(&conn).unwrap()[0].count, 3, "and still shown");
+        // ...due once it has closed, without needing another failure to trigger it.
+        let due = take_due_failures(&conn, 31_000).unwrap();
+        assert_eq!((due.len(), due[0].count), (1, 3));
+        assert!(pending_failures(&conn).unwrap().is_empty());
+        assert!(take_due_failures(&conn, 40_000).unwrap().is_empty(), "each count is taken once");
+
+        // The next failure after that is a new window's first, and gets its own row with nothing carried.
+        assert_eq!(note_failure(&conn, "system:login_failed", 32_000).unwrap(), Some(0));
+    }
+
+    #[test]
     fn the_recovery_pin_works_after_any_number_of_wrong_guesses_and_signs_everyone_out() {
         let (conn, auth) = setup();
         let old = create_session(&conn, Role::Keyholder, None, 0, KEYHOLDER_SESSION_MS).unwrap();
@@ -556,6 +770,61 @@ mod tests {
         reset_password_with_pin(&conn, &auth, PIN, "another good password", 1).unwrap();
         assert!(authenticate(&conn, &old, 2).unwrap().is_none());
         assert!(login(&conn, &auth, "another good password", 2).is_ok());
+    }
+
+    #[test]
+    fn passwords_must_be_at_least_sixteen_characters() {
+        assert_eq!(MIN_PASSWORD_CHARS, 16);
+        assert!(check_password("exactly sixteen!!").is_ok());
+        assert!(matches!(check_password("fifteen chars!!"), Err(AuthError::Weak(_))), "15 is too short");
+        // Characters, not bytes: 16 accented letters is 32 bytes but still 16 characters.
+        assert!(check_password(&"é".repeat(16)).is_ok());
+        assert!(matches!(check_password(&"é".repeat(15)), Err(AuthError::Weak(_))));
+
+        let fresh = Connection::open_in_memory().unwrap();
+        migrate(&fresh).unwrap();
+        let auth = Auth::for_tests(b"test pepper");
+        assert!(matches!(init_keyholder(&fresh, &auth, "a password 15chr", PIN), Ok(())), "16 characters is accepted");
+        let (conn, auth) = setup();
+        assert!(matches!(change_password(&conn, &auth, PW, "fifteen chars!!", 1), Err(AuthError::Weak(_))));
+        assert!(login(&conn, &auth, PW, 2).is_ok(), "a rejected change leaves the old password working");
+    }
+
+    #[test]
+    fn the_settings_a_hash_was_made_under_are_read_back_from_it() {
+        let a = Auth::for_tests(b"test pepper");
+        let phc = a.hash_secret("a long enough password").unwrap();
+        assert_eq!(KdfParams::from_phc(&phc), Some(a.params()));
+        assert!(!a.needs_rehash(&phc));
+        assert!(KdfParams::from_phc("not a hash").is_none());
+        assert!(a.needs_rehash("not a hash"));
+
+        let stronger = Auth::with_params(b"test pepper".to_vec(), KdfParams { m: 16, t: 2, p: 1 });
+        assert!(stronger.needs_rehash(&phc), "a hash made under weaker settings is flagged");
+        assert!(stronger.verify_secret("a long enough password", &phc), "and still verifies");
+        assert_eq!(KdfParams::CURRENT, KdfParams { m: 131_072, t: 3, p: 1 });
+    }
+
+    #[test]
+    fn a_right_password_upgrades_a_weaker_hash_and_signs_nobody_out() {
+        let (conn, weak) = setup();
+        let before = stored_password_hash(&conn).unwrap();
+        assert_eq!(KdfParams::from_phc(&before), Some(weak.params()));
+        let session = login(&conn, &weak, PW, 0).unwrap();
+
+        let stronger = Auth::with_params(b"test pepper".to_vec(), KdfParams { m: 16, t: 2, p: 1 });
+        // A wrong password changes nothing.
+        assert!(matches!(login(&conn, &stronger, "not the password!!", 1), Err(AuthError::Invalid)));
+        assert_eq!(stored_password_hash(&conn).unwrap(), before);
+
+        // The right one upgrades the stored hash to the new settings...
+        login(&conn, &stronger, PW, 2).unwrap();
+        let after = stored_password_hash(&conn).unwrap();
+        assert_eq!(KdfParams::from_phc(&after), Some(stronger.params()));
+        // ...without ending anyone's session, and it keeps working.
+        assert!(authenticate(&conn, &session, 3).unwrap().is_some());
+        assert!(login(&conn, &stronger, PW, 4).is_ok());
+        assert_eq!(stored_password_hash(&conn).unwrap(), after, "an up-to-date hash is left alone");
     }
 
     #[test]
@@ -590,18 +859,38 @@ mod tests {
     }
 
     #[test]
-    fn only_one_device_may_be_paired_until_it_is_revoked() {
+    fn two_devices_may_be_paired_by_default_and_a_third_needs_one_revoked() {
         let (conn, _) = setup();
-        let first = pair_device(&conn, &create_pairing_code(&conn, 0).unwrap(), "phone", 1).unwrap();
-        assert!(matches!(
-            pair_device(&conn, &create_pairing_code(&conn, 2).unwrap(), "laptop", 3),
-            Err(AuthError::DeviceAlreadyPaired)
-        ));
-        let device = list_devices(&conn).unwrap()[0].id;
-        assert!(revoke_device(&conn, device, 4).unwrap());
-        assert!(!revoke_device(&conn, device, 5).unwrap());
-        assert!(authenticate(&conn, &first, 6).unwrap().is_none(), "a revoked device's token must stop working");
-        assert!(pair_device(&conn, &create_pairing_code(&conn, 7).unwrap(), "new phone", 8).is_ok());
+        assert_eq!(max_devices(&conn).unwrap(), 2);
+        let first = pair_device(&conn, &create_pairing_code(&conn, 0).unwrap(), "phone on the LAN address", 1).unwrap();
+        let second = pair_device(&conn, &create_pairing_code(&conn, 2).unwrap(), "phone on the Tailscale address", 3).unwrap();
+        // Both work at once, and they are different sessions.
+        assert_ne!(first, second);
+        assert!(authenticate(&conn, &first, 4).unwrap().is_some() && authenticate(&conn, &second, 4).unwrap().is_some());
+
+        assert!(matches!(pair_device(&conn, &create_pairing_code(&conn, 5).unwrap(), "a third", 6), Err(AuthError::DeviceAlreadyPaired)));
+        let devices = list_devices(&conn).unwrap();
+        assert!(revoke_device(&conn, devices[0].id, 7).unwrap());
+        assert!(!revoke_device(&conn, devices[0].id, 8).unwrap());
+        assert!(authenticate(&conn, &first, 9).unwrap().is_none(), "a revoked device's token must stop working");
+        assert!(authenticate(&conn, &second, 9).unwrap().is_some(), "the other one is untouched");
+        assert!(pair_device(&conn, &create_pairing_code(&conn, 10).unwrap(), "a replacement", 11).is_ok());
+    }
+
+    #[test]
+    fn the_device_limit_is_a_setting_within_bounds() {
+        let (conn, _) = setup();
+        set_max_devices(&conn, 1).unwrap();
+        assert_eq!(max_devices(&conn).unwrap(), 1);
+        pair_device(&conn, &create_pairing_code(&conn, 0).unwrap(), "only", 1).unwrap();
+        assert!(matches!(pair_device(&conn, &create_pairing_code(&conn, 2).unwrap(), "second", 3), Err(AuthError::DeviceAlreadyPaired)));
+
+        // Raising it allows another straight away.
+        set_max_devices(&conn, 3).unwrap();
+        assert!(pair_device(&conn, &create_pairing_code(&conn, 4).unwrap(), "second", 5).is_ok());
+        for bad in [0, -1, 6, 100] {
+            assert!(matches!(set_max_devices(&conn, bad), Err(AuthError::Weak(_))), "{bad}");
+        }
     }
 
     #[test]

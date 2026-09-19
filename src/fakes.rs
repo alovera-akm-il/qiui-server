@@ -162,12 +162,18 @@ impl PodLink for FakePod {
 #[derive(Default)]
 pub struct FakeSender {
     sent: Mutex<Vec<serde_json::Value>>,
+    targets: Mutex<Vec<i64>>,
     gone: Mutex<bool>,
 }
 
 impl FakeSender {
     pub fn sent(&self) -> Vec<serde_json::Value> {
         self.sent.lock().unwrap().clone()
+    }
+
+    /// The device each push went to, in order.
+    pub fn sent_to(&self) -> Vec<i64> {
+        self.targets.lock().unwrap().clone()
     }
 
     /// Make the "push service" answer that the subscription no longer exists.
@@ -178,10 +184,11 @@ impl FakeSender {
 
 #[async_trait]
 impl PushSender for FakeSender {
-    async fn send(&self, _sub: &Subscription, payload: &[u8]) -> Result<(), PushError> {
+    async fn send(&self, sub: &Subscription, payload: &[u8]) -> Result<(), PushError> {
         if *self.gone.lock().unwrap() {
             return Err(PushError::Gone);
         }
+        self.targets.lock().unwrap().push(sub.device_id);
         self.sent.lock().unwrap().push(serde_json::from_slice(payload).unwrap());
         Ok(())
     }

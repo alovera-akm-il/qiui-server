@@ -75,6 +75,16 @@ impl Store {
         }
     }
 
+    /// Write a summary row for every run of folded-in failures whose window has closed. Called by the
+    /// server every few seconds, so a burst is recorded even if nothing else fails afterwards.
+    pub fn flush_failures(&self, now_ms: i64) -> rusqlite::Result<usize> {
+        let due = crate::accounts::take_due_failures(&self.conn, now_ms)?;
+        for p in &due {
+            self.log(now_ms, &p.actor, &p.kind, &serde_json::json!({ "suppressed": p.count, "summary": true }))?;
+        }
+        Ok(due.len())
+    }
+
     /// Remember when the pod was last reached, and how. Battery is stored only if the pod reported one.
     pub fn save_pod_status(&self, now_ms: i64, via: &str, battery: Option<i64>) -> rusqlite::Result<()> {
         let battery = battery.filter(|b| *b > 0);
@@ -220,6 +230,60 @@ mod tests {
         assert_eq!(rows.len(), 2, "200 failures through the API and 1 through the CLI");
         assert!(rows.iter().any(|r| r.actor == "local-cli"));
         assert_eq!(audit::verify(s.connection()).unwrap(), None);
+    }
+
+    #[test]
+    fn a_burst_of_failures_is_visible_at_once_and_recorded_without_waiting_for_another() {
+        let s = Store::open_in_memory().unwrap();
+        s.log_failure(1_000, "system", "login_failed").unwrap();
+        let rows = |s: &Store| audit::entries(s.connection(), 100).unwrap();
+        assert_eq!(rows(&s).len(), 1, "the first failure gets its own row at once");
+        assert_eq!(rows(&s)[0].detail, r#"{"suppressed":0}"#);
+
+        for t in 0..50 {
+            s.log_failure(2_000 + t, "system", "login_failed").unwrap();
+        }
+        assert_eq!(rows(&s).len(), 1, "the rest are folded in");
+        assert_eq!(crate::accounts::pending_failures(s.connection()).unwrap()[0].count, 50, "but visible immediately");
+
+        // Nothing is written while the window is open; when it closes the worker writes the summary itself.
+        assert_eq!(s.flush_failures(20_000).unwrap(), 0);
+        assert_eq!(s.flush_failures(31_500).unwrap(), 1);
+        let after = rows(&s);
+        assert_eq!(after.len(), 2);
+        assert_eq!(after[0].detail, r#"{"summary":true,"suppressed":50}"#);
+        assert!(crate::accounts::pending_failures(s.connection()).unwrap().is_empty());
+        assert_eq!(s.flush_failures(40_000).unwrap(), 0, "and only once");
+
+        // The next failure is a new window's first, and gets its own row.
+        s.log_failure(45_000, "system", "login_failed").unwrap();
+        assert_eq!(rows(&s).len(), 3);
+        assert_eq!(audit::verify(s.connection()).unwrap(), None);
+    }
+
+    #[test]
+    fn each_route_has_its_own_counter_including_the_command_line_ones() {
+        let s = Store::open_in_memory().unwrap();
+        // All five ways to fail, all at the same instant, after the API login has been flooded.
+        for t in 0..100 {
+            s.log_failure(1_000 + t, "system", "login_failed").unwrap();
+        }
+        for (actor, kind) in [
+            ("local-cli", "login_failed"),           // the command line's keyholder password
+            ("local-cli", "password_reset_failed"),  // the recovery PIN
+            ("system", "pairing_failed"),            // a pairing code
+            ("system", "password_change_failed"),    // a wrong current password on the API
+        ] {
+            s.log_failure(1_500, actor, kind).unwrap();
+        }
+        let rows = audit::entries(s.connection(), 100).unwrap();
+        let mut seen: Vec<(String, String)> = rows.iter().map(|r| (r.actor.clone(), r.kind.clone())).collect();
+        seen.sort();
+        assert_eq!(seen.len(), 5, "one row for the flooded route and one first row for each of the other four: {seen:?}");
+        assert!(seen.contains(&("local-cli".into(), "login_failed".into())), "a CLI failure surfaces even while the API is hammered");
+        // The only thing pending is the flood itself.
+        let pending = crate::accounts::pending_failures(s.connection()).unwrap();
+        assert_eq!((pending.len(), pending[0].count), (1, 99));
     }
 
     #[test]

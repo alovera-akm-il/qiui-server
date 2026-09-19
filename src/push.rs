@@ -128,7 +128,16 @@ pub fn delete_subscription(conn: &Connection, device_id: i64) -> rusqlite::Resul
     Ok(())
 }
 
-/// The subscription of the wearer's active (unrevoked) device, if it has one.
+/// Every subscription belonging to an active (unrevoked) device.
+pub fn active_subscriptions(conn: &Connection) -> rusqlite::Result<Vec<Subscription>> {
+    let mut stmt = conn.prepare(
+        "SELECT s.device_id, s.endpoint, s.p256dh, s.auth FROM push_subscriptions s
+         JOIN devices d ON d.id = s.device_id WHERE d.revoked_ms IS NULL ORDER BY s.device_id",
+    )?;
+    stmt.query_map([], |r| Ok(Subscription { device_id: r.get(0)?, endpoint: r.get(1)?, p256dh: r.get(2)?, auth: r.get(3)? }))?.collect()
+}
+
+/// The first active subscription, if any.
 pub fn active_subscription(conn: &Connection) -> rusqlite::Result<Option<Subscription>> {
     conn.query_row(
         "SELECT s.device_id, s.endpoint, s.p256dh, s.auth FROM push_subscriptions s
@@ -253,7 +262,10 @@ pub async fn notify_once(st: &AppState, sender: &dyn PushSender) -> usize {
         let entries = audit::entries_after(conn, cursor, 50)?;
         let Some(last) = entries.last().map(|e| e.id) else { return Ok(None) };
         conn.execute("UPDATE push_cursor SET last_audit_id = ?1 WHERE id = 1", [last])?;
-        let Some(sub) = active_subscription(conn)? else { return Ok(None) };
+        let subs = active_subscriptions(conn)?;
+        if subs.is_empty() {
+            return Ok(None);
+        }
 
         let mut notes = Vec::new();
         for e in entries {
@@ -267,23 +279,29 @@ pub async fn notify_once(st: &AppState, sender: &dyn PushSender) -> usize {
                 notes.push(n);
             }
         }
-        Ok(Some((sub, notes)))
+        Ok(Some((subs, notes)))
     })
     .await;
 
-    let Ok(Some((sub, notes))) = batch else { return 0 };
+    let Ok(Some((mut subs, notes))) = batch else { return 0 };
     let mut sent = 0;
     for n in notes {
         let Ok(payload) = serde_json::to_vec(&n) else { continue };
-        match sender.send(&sub, &payload).await {
-            Ok(()) => sent += 1,
-            Err(PushError::Gone) => {
+        let mut gone = Vec::new();
+        for sub in &subs {
+            match sender.send(sub, &payload).await {
+                Ok(()) => sent += 1,
                 // The device unsubscribed or was uninstalled: forget it.
-                let device = sub.device_id;
-                let _ = api::db(st, move |store, _, _| Ok(delete_subscription(store.connection(), device)?)).await;
-                break;
+                Err(PushError::Gone) => gone.push(sub.device_id),
+                Err(PushError::Other(e)) => eprintln!("push: {e}"),
             }
-            Err(PushError::Other(e)) => eprintln!("push: {e}"),
+        }
+        for device in gone {
+            subs.retain(|s| s.device_id != device);
+            let _ = api::db(st, move |store, _, _| Ok(delete_subscription(store.connection(), device)?)).await;
+        }
+        if subs.is_empty() {
+            break;
         }
     }
     sent

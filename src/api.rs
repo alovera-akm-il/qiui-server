@@ -23,6 +23,7 @@ use crate::accounts::{self, Auth, AuthError, Principal, Role};
 use crate::audit;
 use crate::cloud::{CloudError, LazyCloud};
 use crate::hardware::{Hardware, Intent, Stage};
+use crate::hashgate::{Busy, HashGate, TurnedAway};
 use crate::machine::{self, Actor, Machine};
 use crate::pod::{PodError, PodOp, PodStatus};
 use crate::queue::{self, Command, QueueError, Queued};
@@ -43,12 +44,16 @@ pub struct AppState {
     pub vault: Option<Arc<LazyCloud>>,
     /// Where `config.json` lives, so a password change can re-seal the credentials.
     pub config_root: Option<std::path::PathBuf>,
+    /// Keeps a flood of password guesses from taking all the memory and CPU. See `hashgate.rs`.
+    pub hash_gate: Arc<HashGate>,
+    /// Password attempts the gate turned away, counted per route so a flood is never invisible.
+    pub turned_away: Arc<TurnedAway>,
     pub clock: Arc<dyn Fn() -> i64 + Send + Sync>,
 }
 
 impl AppState {
     pub fn new(store: Store, auth: Auth, hardware: Hardware) -> Self {
-        Self { store: Arc::new(Mutex::new(store)), auth: Arc::new(auth), hardware: Arc::new(hardware), push_key: None, vault: None, config_root: None, clock: Arc::new(system_now_ms) }
+        Self { store: Arc::new(Mutex::new(store)), auth: Arc::new(auth), hardware: Arc::new(hardware), push_key: None, vault: None, config_root: None, hash_gate: Arc::new(HashGate::default()), turned_away: Arc::new(TurnedAway::default()), clock: Arc::new(system_now_ms) }
     }
 
     pub fn with_push_key(mut self, key: String) -> Self {
@@ -151,6 +156,20 @@ fn control_lost() -> ApiError {
     )
 }
 
+fn busy() -> ApiError {
+    ApiError::coded(StatusCode::SERVICE_UNAVAILABLE, "busy", "The server is busy checking passwords. Try again in a moment.")
+}
+
+/// The gate was full, so this password attempt was not even checked. Say so in the audit trail: the first
+/// after a quiet spell gets its own row at once, and the rest are counted in memory (shown to the keyholder
+/// immediately, and folded into the log every few seconds).
+async fn turned_away(st: &AppState, route: &'static str) -> ApiError {
+    if st.turned_away.note(route) {
+        let _ = db(st, move |store, _, now| Ok(store.log_failure(now, "system", route)?)).await;
+    }
+    busy()
+}
+
 fn credentials_locked() -> ApiError {
     ApiError::coded(
         StatusCode::SERVICE_UNAVAILABLE,
@@ -190,6 +209,12 @@ async fn fail_cloud(st: &AppState, e: CloudError) -> ApiError {
         let _ = db(st, |store, _, now| Ok(store.log(now, "system", "control_lost", &json!({}))?)).await;
     }
     cloud_error(e)
+}
+
+impl From<Busy> for ApiError {
+    fn from(_: Busy) -> Self {
+        busy()
+    }
 }
 
 impl From<rusqlite::Error> for ApiError {
@@ -272,11 +297,12 @@ fn wearer_state(store: &mut Store, now: i64) -> ApiResult {
 fn keyholder_state(store: &mut Store, now: i64) -> ApiResult {
     let m = current(store, now)?;
     let mut view = state_view(&m, store, now)?;
-    let device = accounts::list_devices(store.connection())?.into_iter().find(|d| d.revoked_ms.is_none());
-    view["paired_device"] = match device {
-        Some(d) => json!({ "id": d.id, "name": d.name, "paired_ms": d.paired_ms, "last_seen_ms": d.last_seen_ms }),
-        None => Value::Null,
-    };
+    let devices: Vec<Value> = accounts::list_devices(store.connection())?
+        .into_iter()
+        .filter(|d| d.revoked_ms.is_none())
+        .map(|d| json!({ "id": d.id, "name": d.name, "paired_ms": d.paired_ms, "last_seen_ms": d.last_seen_ms }))
+        .collect();
+    view["paired_devices"] = Value::Array(devices);
     Ok(Json(view))
 }
 
@@ -314,27 +340,75 @@ struct LoginReq {
 }
 
 async fn keyholder_login(State(st): State<AppState>, Json(req): Json<LoginReq>) -> ApiResult {
-    let vault = st.vault.clone();
-    db(&st, move |store, auth, now| match accounts::login(store.connection(), auth, &req.password, now) {
-        Ok(token) => {
-            store.log(now, "keyholder", "login", &json!({}))?;
-            // The password is right there: use it to decrypt the QIUI credentials into memory.
-            if let Some(vault) = &vault {
-                match vault.unlock(auth, &req.password) {
+    // 1. The stored hash: quick, under the database lock.
+    let hash = db(&st, |store, _, _| Ok(accounts::stored_password_hash(store.connection())?)).await?;
+
+    // 2. The slow check happens off the lock, a couple at a time, so guessing cannot stall anything else.
+    //    A right password made under weaker settings is re-hashed here, while it is in hand.
+    let (auth, password) = (st.auth.clone(), req.password);
+    let checked = st
+        .hash_gate
+        .run({
+            let (auth, password, hash) = (auth.clone(), password.clone(), hash.clone());
+            move || {
+                let ok = auth.verify_secret(&password, &hash);
+                let upgraded = if ok && auth.needs_rehash(&hash) { auth.hash_secret(&password).ok() } else { None };
+                (ok, upgraded)
+            }
+        })
+        .await;
+    let (ok, upgraded) = match checked {
+        Ok(done) => done,
+        Err(Busy) => return Err(turned_away(&st, "login_busy").await),
+    };
+    if !ok {
+        db(&st, |store, _, now| Ok(store.log_failure(now, "system", "login_failed")?)).await?;
+        return Err(AuthError::Invalid.into());
+    }
+
+    // 3. The session and the audit trail: quick, under the lock.
+    let token = db(&st, move |store, _, now| {
+        if let Some(new_hash) = &upgraded {
+            accounts::upgrade_password_hash(store.connection(), new_hash)?;
+            store.log(now, "system", "kdf_upgraded", &json!({ "what": "password hash" }))?;
+        }
+        let token = accounts::start_keyholder_session(store.connection(), now)?;
+        store.log(now, "keyholder", "login", &json!({}))?;
+        Ok(token)
+    })
+    .await?;
+
+    // 4. The password is right there: decrypt the QIUI credentials into memory, and strengthen how they are
+    //    sealed if they were sealed under older settings. Slow, so also off the lock.
+    if let Some(vault) = st.vault.clone() {
+        let root = st.config_root.clone();
+        let work = st
+            .hash_gate
+            .run(move || {
+                let unlocked = vault.unlock(&auth, &password);
+                let upgraded = match (&unlocked, &root) {
+                    (Ok(_), Some(root)) => crate::datadir::upgrade_sealed(root, &auth, &password).unwrap_or(false),
+                    _ => false,
+                };
+                (unlocked, upgraded)
+            })
+            .await;
+        if let Ok((unlocked, upgraded)) = work {
+            db(&st, move |store, _, now| {
+                match unlocked {
                     Ok(true) => store.log(now, "system", "credentials_unlocked", &json!({}))?,
                     Ok(false) => {}
                     Err(e) => store.log(now, "system", "credentials_unlock_failed", &json!({ "error": e.to_string() }))?,
                 }
-            }
-            Ok(Json(json!({ "token": token, "expires_in_secs": accounts::KEYHOLDER_SESSION_MS / 1000 })))
+                if upgraded {
+                    store.log(now, "system", "kdf_upgraded", &json!({ "what": "sealed credentials" }))?;
+                }
+                Ok(())
+            })
+            .await?;
         }
-        Err(AuthError::Invalid) => {
-            store.log_failure(now, "system", "login_failed")?;
-            Err(AuthError::Invalid.into())
-        }
-        Err(e) => Err(e.into()),
-    })
-    .await
+    }
+    Ok(Json(json!({ "token": token, "expires_in_secs": accounts::KEYHOLDER_SESSION_MS / 1000 })))
 }
 
 #[derive(Deserialize)]
@@ -543,6 +617,7 @@ struct AuditQuery {
 
 async fn kh_audit(State(st): State<AppState>, Query(q): Query<AuditQuery>) -> ApiResult {
     let limit = q.limit.unwrap_or(100).clamp(1, 1000);
+    let in_memory = st.turned_away.peek_extra();
     db(&st, move |store, _, _| {
         let conn = store.connection();
         let intact = audit::verify(conn)?.is_none();
@@ -553,7 +628,22 @@ async fn kh_audit(State(st): State<AppState>, Query(q): Query<AuditQuery>) -> Ap
                 json!({ "id": e.id, "ts_ms": e.ts_ms, "actor": e.actor, "kind": e.kind, "detail": detail })
             })
             .collect();
-        Ok(Json(json!({ "chain_intact": intact, "entries": entries })))
+        // Failures folded into the next row are shown here at once, so a burst is never hidden by summarising.
+        let mut counts = accounts::pending_failures(conn)?;
+        // Attempts turned away since the last fold into the database are added on top, so nothing is behind.
+        for (route, n) in in_memory {
+            let key = format!("system:{route}");
+            match counts.iter_mut().find(|p| p.actor == "system" && p.kind == route) {
+                Some(p) => p.count += n as i64,
+                None => {
+                    let since_ms = accounts::failure_window_start(conn, &key)?.unwrap_or_default();
+                    counts.push(accounts::PendingFailure { actor: "system".into(), kind: route.into(), count: n as i64, since_ms });
+                }
+            }
+        }
+        let pending: Vec<Value> =
+            counts.into_iter().map(|p| json!({ "actor": p.actor, "kind": p.kind, "count": p.count, "since_ms": p.since_ms })).collect();
+        Ok(Json(json!({ "chain_intact": intact, "entries": entries, "pending_failures": pending })))
     })
     .await
 }
@@ -596,30 +686,64 @@ struct PasswordReq {
 }
 
 async fn kh_change_password(State(st): State<AppState>, Json(req): Json<PasswordReq>) -> ApiResult {
-    let config_root = st.config_root.clone();
-    db(&st, move |store, auth, now| {
-        accounts::change_password(store.connection(), auth, &req.current_password, &req.new_password, now)?;
+    // Cheap check first, so a too-short password never costs a hash.
+    accounts::check_password(&req.new_password)?;
+
+    // Every slow step is off the database lock and goes through the gate.
+    let hash = db(&st, |store, _, _| Ok(accounts::stored_password_hash(store.connection())?)).await?;
+    let auth = st.auth.clone();
+    let current_ok = match st
+        .hash_gate
+        .run({
+            let (auth, current) = (auth.clone(), req.current_password.clone());
+            move || auth.verify_secret(&current, &hash)
+        })
+        .await
+    {
+        Ok(ok) => ok,
+        Err(Busy) => return Err(turned_away(&st, "password_change_busy").await),
+    };
+    if !current_ok {
+        db(&st, |store, _, now| Ok(store.log_failure(now, "system", "password_change_failed")?)).await?;
+        return Err(AuthError::Invalid.into());
+    }
+    let new_hash = st
+        .hash_gate
+        .run({
+            let (auth, new) = (auth.clone(), req.new_password.clone());
+            move || auth.hash_secret(&new)
+        })
+        .await??;
+    db(&st, move |store, _, now| {
+        accounts::replace_password_hash(store.connection(), &new_hash, now)?;
         store.log(now, "keyholder", "password_changed", &json!({}))?;
-        // The sealed QIUI credentials are keyed to the password, so they must move to the new one.
-        let credentials = match &config_root {
-            None => "none",
-            Some(root) => match crate::datadir::reseal_config(root, auth, &req.current_password, &req.new_password) {
+        Ok(())
+    })
+    .await?;
+
+    // The sealed QIUI credentials are keyed to the password, so they must move to the new one.
+    let credentials = match st.config_root.clone() {
+        None => "none",
+        Some(root) => {
+            let (current, new) = (req.current_password, req.new_password);
+            let outcome = st.hash_gate.run(move || crate::datadir::reseal_config(&root, &auth, &current, &new)).await?;
+            match outcome {
                 Ok(true) => "resealed",
                 Ok(false) => "none",
                 Err(e) => {
-                    store.log(now, "system", "credentials_reseal_failed", &json!({ "error": e.to_string() }))?;
+                    let error = e.to_string();
+                    db(&st, move |store, _, now| Ok(store.log(now, "system", "credentials_reseal_failed", &json!({ "error": error }))?)).await?;
                     "failed"
                 }
-            },
-        };
-        let note = if credentials == "failed" {
-            "The password was changed, but the QIUI credentials could not be re-encrypted. Run `qiui-server config set-client-id` again."
-        } else {
-            "All sessions were signed out. Sign in again."
-        };
-        Ok(Json(json!({ "changed": true, "credentials": credentials, "note": note })))
-    })
-    .await
+            }
+        }
+    };
+    let note = if credentials == "failed" {
+        "The password was changed, but the QIUI credentials could not be re-encrypted. Run `qiui-server config set-client-id` again."
+    } else {
+        "All sessions were signed out. Sign in again."
+    };
+    Ok(Json(json!({ "changed": true, "credentials": credentials, "note": note })))
 }
 
 async fn kh_logout(State(st): State<AppState>, req: Request) -> ApiResult {
@@ -727,6 +851,20 @@ async fn kh_lock(State(st): State<AppState>) -> ApiResult {
 
 async fn kh_sync(State(st): State<AppState>) -> ApiResult {
     server_sync(&st, Actor::Keyholder).await
+}
+
+/// Write the summary rows for runs of failed attempts whose window has closed. The server calls this every
+/// few seconds, so a burst of guesses is recorded even when nothing else fails afterwards.
+pub async fn flush_failure_summaries(st: &AppState) -> usize {
+    let extra = st.turned_away.take_extra();
+    db(st, move |store, _, now| {
+        for (route, n) in extra {
+            accounts::add_pending_failures(store.connection(), &format!("system:{route}"), n as i64, now)?;
+        }
+        Ok(store.flush_failures(now)?)
+    })
+    .await
+    .unwrap_or(0)
 }
 
 /// Write an event that has no request behind it (background workers).
@@ -2176,6 +2314,288 @@ mod tests {
         let kh2 = v.h.call("POST", "/api/keyholder/login", None, Some(json!({ "password": "a brand new password" }))).await.1["token"].as_str().unwrap().to_string();
         assert!(v.h.audit_kinds(&kh2).await.contains(&"credentials_reseal_failed".to_string()));
         let _ = std::fs::remove_dir_all(&v.dir);
+    }
+
+    // ---------- two paired devices ----------
+
+    #[tokio::test]
+    async fn one_phone_can_be_paired_on_two_addresses_and_a_third_device_is_refused() {
+        let h = harness();
+        let kh = h.keyholder().await;
+        let lan = h.wearer(&kh).await; // e.g. http://<lan-ip>:8443
+        let tailscale = h.wearer(&kh).await; // e.g. https://<name>.ts.net
+
+        // Both work, and they see the same lock.
+        h.call("POST", "/api/wearer/request-unlock", Some(&lan), None).await;
+        let (s, v) = h.call("GET", "/api/wearer/state", Some(&tailscale), None).await;
+        assert_eq!((s, v["lock"].as_str()), (StatusCode::OK, Some("requested")));
+
+        // The keyholder sees both.
+        let (_, st) = h.call("GET", "/api/keyholder/state", Some(&kh), None).await;
+        assert_eq!(st["paired_devices"].as_array().unwrap().len(), 2);
+
+        // A third needs one revoked first.
+        let (_, code) = h.call("POST", "/api/keyholder/pairing-code", Some(&kh), None).await;
+        let (s, v) = h.call("POST", "/api/wearer/pair", None, Some(json!({ "code": code["code"], "device_name": "third" }))).await;
+        assert_eq!(s, StatusCode::CONFLICT, "{v}");
+        let (_, d) = h.call("GET", "/api/keyholder/devices", Some(&kh), None).await;
+        let first = d["devices"][0]["id"].as_i64().unwrap();
+        h.call("POST", &format!("/api/keyholder/devices/{first}/revoke"), Some(&kh), None).await;
+        let (s, _) = h.call("GET", "/api/wearer/state", Some(&lan), None).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED, "the revoked device is out");
+        let (s, _) = h.call("GET", "/api/wearer/state", Some(&tailscale), None).await;
+        assert_eq!(s, StatusCode::OK, "the other is untouched");
+        let (s, _) = h.call("POST", "/api/wearer/pair", None, Some(json!({ "code": code["code"], "device_name": "third" }))).await;
+        assert_eq!(s, StatusCode::OK, "now there is room");
+    }
+
+    #[tokio::test]
+    async fn every_subscribed_device_is_notified_and_only_active_ones() {
+        let h = harness();
+        let kh = h.keyholder().await;
+        let a = h.wearer(&kh).await;
+        let b = h.wearer(&kh).await;
+        h.call("POST", "/api/wearer/push/subscribe", Some(&a), Some(good_subscription())).await;
+        h.call("POST", "/api/wearer/push/subscribe", Some(&b), Some(good_subscription())).await;
+        let sender = FakeSender::default();
+        crate::push::notify_once(&h.state, &sender).await; // sets the cursor
+
+        h.call("POST", "/api/keyholder/messages", Some(&kh), Some(json!({ "body": "hello both" }))).await;
+        assert_eq!(crate::push::notify_once(&h.state, &sender).await, 2);
+        let mut to = sender.sent_to();
+        to.sort();
+        assert_eq!(to.len(), 2);
+        assert_ne!(to[0], to[1], "one push per device, not two to the same one");
+
+        // Revoke one: the next message reaches only the other.
+        let (_, d) = h.call("GET", "/api/keyholder/devices", Some(&kh), None).await;
+        let revoked = d["devices"][0]["id"].as_i64().unwrap();
+        h.call("POST", &format!("/api/keyholder/devices/{revoked}/revoke"), Some(&kh), None).await;
+        h.call("POST", "/api/keyholder/messages", Some(&kh), Some(json!({ "body": "hello one" }))).await;
+        assert_eq!(crate::push::notify_once(&h.state, &sender).await, 1);
+        assert!(!sender.sent_to()[2..].contains(&revoked));
+    }
+
+    #[tokio::test]
+    async fn a_device_that_stopped_listening_is_dropped_without_affecting_the_others() {
+        let h = harness();
+        let kh = h.keyholder().await;
+        let a = h.wearer(&kh).await;
+        let b = h.wearer(&kh).await;
+        h.call("POST", "/api/wearer/push/subscribe", Some(&a), Some(good_subscription())).await;
+        h.call("POST", "/api/wearer/push/subscribe", Some(&b), Some(good_subscription())).await;
+        let sender = FakeSender::default();
+        crate::push::notify_once(&h.state, &sender).await;
+
+        sender.set_gone(); // the push service says every subscription is gone
+        h.call("POST", "/api/keyholder/messages", Some(&kh), Some(json!({ "body": "anyone?" }))).await;
+        assert_eq!(crate::push::notify_once(&h.state, &sender).await, 0);
+        assert!(crate::push::active_subscriptions(h.state.store.lock().unwrap().connection()).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_device_limit_is_the_keyholders_to_change() {
+        let h = harness();
+        let kh = h.keyholder().await;
+        h.state.store.lock().unwrap().connection().execute("INSERT INTO settings (key, value) VALUES ('max_devices', '1') ON CONFLICT(key) DO UPDATE SET value='1'", []).unwrap();
+        let _only = h.wearer(&kh).await;
+        let (_, code) = h.call("POST", "/api/keyholder/pairing-code", Some(&kh), None).await;
+        let (s, _) = h.call("POST", "/api/wearer/pair", None, Some(json!({ "code": code["code"], "device_name": "second" }))).await;
+        assert_eq!(s, StatusCode::CONFLICT);
+    }
+
+    // ---------- password-check cost ----------
+
+    fn weak_then_strong() -> (Auth, Auth) {
+        (
+            Auth::for_tests(b"api test pepper"),
+            Auth::with_params(b"api test pepper".to_vec(), accounts::KdfParams { m: 16, t: 2, p: 1 }),
+        )
+    }
+
+    /// A server whose stored hash was made under weaker settings than it now uses.
+    fn upgraded_harness() -> Harness {
+        let (weak, strong) = weak_then_strong();
+        let store = Store::open_in_memory().unwrap();
+        accounts::init_keyholder(store.connection(), &weak, PW, PIN).unwrap();
+        let now = Arc::new(AtomicI64::new(1_000_000));
+        let clock = now.clone();
+        let pod = Arc::new(FakePod::default());
+        let cloud = Arc::new(FakeCloud::default());
+        let mut state = AppState::new(store, strong, Hardware::new(cloud.clone(), pod.clone()));
+        state.clock = Arc::new(move || clock.load(Ordering::SeqCst));
+        Harness { app: router(state.clone()), now, pod, cloud, state }
+    }
+
+    #[tokio::test]
+    async fn signing_in_strengthens_an_older_password_hash_once_and_logs_it() {
+        let h = upgraded_harness();
+        let stored = |h: &Harness| accounts::stored_password_hash(h.state.store.lock().unwrap().connection()).unwrap();
+        assert_eq!(accounts::KdfParams::from_phc(&stored(&h)).unwrap().m, 8);
+
+        let (s, _) = h.call("POST", "/api/keyholder/login", None, Some(json!({ "password": "not the password!!" }))).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
+        assert_eq!(accounts::KdfParams::from_phc(&stored(&h)).unwrap().m, 8, "a wrong password upgrades nothing");
+
+        let kh = h.keyholder().await;
+        assert_eq!(accounts::KdfParams::from_phc(&stored(&h)).unwrap().m, 16);
+        h.keyholder().await; // a second sign-in finds it up to date
+        let upgrades = h.audit_kinds(&kh).await.iter().filter(|k| *k == "kdf_upgraded").count();
+        assert_eq!(upgrades, 1);
+    }
+
+    #[tokio::test]
+    async fn signing_in_re_seals_credentials_that_were_sealed_under_older_settings() {
+        use crate::secrets::Secrets;
+        let (weak, strong) = weak_then_strong();
+        let dir = std::env::temp_dir().join(format!("qiui-upgrade-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut cfg = crate::datadir::Config::default();
+        cfg.seal_secrets(&weak, PW, &Secrets { client_id: Some("Client_UPGRADE".into()), api_key: None }).unwrap();
+        crate::datadir::save_config(&dir, &cfg).unwrap();
+        assert_eq!(cfg.secrets.as_ref().unwrap().m, Some(8));
+
+        let store = Store::open_in_memory().unwrap();
+        accounts::init_keyholder(store.connection(), &strong, PW, PIN).unwrap();
+        let vault = Arc::new(LazyCloud::sealed(cfg.secrets.clone().unwrap(), "AA:BB", false));
+        let state = AppState::new(store, strong, Hardware::new(vault.clone(), Arc::new(FakePod::default()))).with_vault(vault.clone(), dir.clone());
+        let h = Harness { app: router(state.clone()), now: Arc::new(AtomicI64::new(1_000_000)), pod: Arc::new(FakePod::default()), cloud: Arc::new(FakeCloud::default()), state };
+
+        let kh = h.keyholder().await;
+        assert!(vault.is_unlocked());
+        let on_disk = crate::datadir::load_config(&dir).unwrap().secrets.unwrap();
+        assert_eq!((on_disk.v, on_disk.m, on_disk.t), (2, Some(16), Some(2)), "now sealed under the current settings");
+        assert_eq!(crate::datadir::load_config(&dir).unwrap().secrets(&Auth::with_params(b"api test pepper".to_vec(), accounts::KdfParams { m: 16, t: 2, p: 1 }), PW).unwrap().client_id.as_deref(), Some("Client_UPGRADE"));
+        assert!(h.audit_kinds(&kh).await.contains(&"kdf_upgraded".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_flood_of_guesses_is_turned_away_when_the_gate_is_full_and_everything_else_keeps_answering() {
+        let mut h = harness();
+        let kh = h.keyholder().await;
+        let w = h.wearer(&kh).await;
+        // A gate with one slot and no queue, and that slot busy with (pretend) password checks.
+        h.state.hash_gate = Arc::new(HashGate::new(1, 0));
+        h.app = router(h.state.clone());
+        let gate = h.state.hash_gate.clone();
+        let hog = tokio::spawn(async move { gate.run(|| std::thread::sleep(std::time::Duration::from_millis(600))).await });
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+
+        // A guess now is told the server is busy, rather than queued forever or locking anyone out...
+        let (s, v) = h.call("POST", "/api/keyholder/login", None, Some(json!({ "password": "a guess" }))).await;
+        assert_eq!((s, v["code"].as_str()), (StatusCode::SERVICE_UNAVAILABLE, Some("busy")));
+        let (s, v) = h.call("POST", "/api/keyholder/password", Some(&kh), Some(json!({ "current_password": PW, "new_password": "a brand new password" }))).await;
+        assert_eq!((s, v["code"].as_str()), (StatusCode::SERVICE_UNAVAILABLE, Some("busy")));
+
+        // ...while the wearer's app and the keyholder's other requests are not held up at all.
+        let (s, _) = h.call("GET", "/api/wearer/state", Some(&w), None).await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, _) = h.call("GET", "/api/keyholder/state", Some(&kh), None).await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(!hog.is_finished(), "those answers came back while the password checks were still running");
+
+        // Once there is room, the right password works straight away: nothing was locked.
+        hog.await.unwrap().unwrap();
+        let (s, _) = h.call("POST", "/api/keyholder/login", None, Some(json!({ "password": PW }))).await;
+        assert_eq!(s, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_new_password_shorter_than_sixteen_characters_is_refused_before_any_hashing() {
+        let h = harness();
+        let kh = h.keyholder().await;
+        let (s, v) = h.call("POST", "/api/keyholder/password", Some(&kh), Some(json!({ "current_password": PW, "new_password": "only 15 chars!!" }))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+        assert!(v["error"].as_str().unwrap().contains("16"));
+        let (s, _) = h.call("GET", "/api/keyholder/state", Some(&kh), None).await;
+        assert_eq!(s, StatusCode::OK, "nothing changed, and the session is still good");
+    }
+
+    #[tokio::test]
+    async fn a_burst_of_wrong_passwords_is_shown_to_the_keyholder_at_once_and_recorded_when_the_window_closes() {
+        let h = harness();
+        let kh = h.keyholder().await;
+        for _ in 0..12 {
+            h.call("POST", "/api/keyholder/login", None, Some(json!({ "password": "wrong wrong wrong" }))).await;
+        }
+        // At once: the first is its own row, and the other eleven are shown as pending, not hidden.
+        let (_, a) = h.call("GET", "/api/keyholder/audit?limit=100", Some(&kh), None).await;
+        let rows: Vec<&Value> = a["entries"].as_array().unwrap().iter().filter(|e| e["kind"] == "login_failed").collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["detail"]["suppressed"], 0);
+        assert_eq!(a["pending_failures"][0]["count"], 11);
+        assert_eq!((a["pending_failures"][0]["kind"].as_str(), a["pending_failures"][0]["actor"].as_str()), (Some("login_failed"), Some("system")));
+
+        // Too early for a summary row; then the window closes and the worker writes it, with no further failure.
+        assert_eq!(flush_failure_summaries(&h.state).await, 0);
+        h.advance(31_000);
+        assert_eq!(flush_failure_summaries(&h.state).await, 1);
+        let (_, a) = h.call("GET", "/api/keyholder/audit?limit=100", Some(&kh), None).await;
+        let rows: Vec<&Value> = a["entries"].as_array().unwrap().iter().filter(|e| e["kind"] == "login_failed").collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!((rows[0]["detail"]["suppressed"].as_i64(), rows[0]["detail"]["summary"].as_bool()), (Some(11), Some(true)));
+        assert!(a["pending_failures"].as_array().unwrap().is_empty());
+        assert_eq!(a["chain_intact"], true);
+    }
+
+    #[tokio::test]
+    async fn every_route_counts_its_own_failures_so_a_flood_on_one_cannot_hide_another() {
+        let h = harness();
+        let kh = h.keyholder().await;
+        // Hammer the keyholder login.
+        for _ in 0..15 {
+            h.call("POST", "/api/keyholder/login", None, Some(json!({ "password": "wrong wrong wrong" }))).await;
+        }
+        // Then one bad pairing code and one bad "current password" on the change-password route.
+        h.call("POST", "/api/wearer/pair", None, Some(json!({ "code": "AAAA-AAAA", "device_name": "x" }))).await;
+        h.call("POST", "/api/keyholder/password", Some(&kh), Some(json!({ "current_password": "not the password!!", "new_password": "a brand new password" }))).await;
+
+        let (_, a) = h.call("GET", "/api/keyholder/audit?limit=200", Some(&kh), None).await;
+        let count = |kind: &str| a["entries"].as_array().unwrap().iter().filter(|e| e["kind"] == kind).count();
+        assert_eq!(count("login_failed"), 1, "the login flood is one row plus a pending count");
+        assert_eq!(count("pairing_failed"), 1, "the first bad pairing code still got its own row");
+        assert_eq!(count("password_change_failed"), 1, "and so did the first bad change-password attempt");
+        let pending = a["pending_failures"].as_array().unwrap();
+        assert_eq!(pending.len(), 1, "only the flooded route has anything pending: {pending:?}");
+        assert_eq!((pending[0]["kind"].as_str(), pending[0]["count"].as_i64()), (Some("login_failed"), Some(14)));
+    }
+
+    #[tokio::test]
+    async fn attempts_the_gate_turns_away_are_counted_per_route_and_shown_at_once() {
+        let mut h = harness();
+        let kh = h.keyholder().await;
+        h.state.hash_gate = Arc::new(HashGate::new(1, 0));
+        h.app = router(h.state.clone());
+        let gate = h.state.hash_gate.clone();
+        let hog = tokio::spawn(async move { gate.run(|| std::thread::sleep(std::time::Duration::from_millis(500))).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Twelve login guesses and two change-password guesses all turned away, none of them checked.
+        for _ in 0..12 {
+            let (s, v) = h.call("POST", "/api/keyholder/login", None, Some(json!({ "password": "a guess" }))).await;
+            assert_eq!((s, v["code"].as_str()), (StatusCode::SERVICE_UNAVAILABLE, Some("busy")));
+        }
+        for _ in 0..2 {
+            h.call("POST", "/api/keyholder/password", Some(&kh), Some(json!({ "current_password": "a guess at it!!", "new_password": "a brand new password" }))).await;
+        }
+        let (_, a) = h.call("GET", "/api/keyholder/audit?limit=100", Some(&kh), None).await;
+        let rows = |kind: &str| a["entries"].as_array().unwrap().iter().filter(|e| e["kind"] == kind).count();
+        assert_eq!((rows("login_busy"), rows("password_change_busy")), (1, 1), "each route's first turned-away attempt has its own row at once");
+        let pending: std::collections::HashMap<String, i64> =
+            a["pending_failures"].as_array().unwrap().iter().map(|p| (p["kind"].as_str().unwrap().to_string(), p["count"].as_i64().unwrap())).collect();
+        assert_eq!(pending["login_busy"], 11, "the other eleven are visible immediately, before any flush");
+        assert_eq!(pending["password_change_busy"], 1);
+
+        // The worker folds them in, and when the window closes writes the summary rows.
+        hog.await.unwrap().unwrap();
+        flush_failure_summaries(&h.state).await;
+        h.advance(31_000);
+        assert_eq!(flush_failure_summaries(&h.state).await, 2);
+        let (_, a) = h.call("GET", "/api/keyholder/audit?limit=100", Some(&kh), None).await;
+        let summary = a["entries"].as_array().unwrap().iter().find(|e| e["kind"] == "login_busy" && e["detail"]["summary"] == true).unwrap();
+        assert_eq!(summary["detail"]["suppressed"], 11);
+        assert!(a["pending_failures"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]

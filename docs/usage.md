@@ -74,7 +74,7 @@ cargo build --release          # binary: target/release/qiui-server
 qiui-server init
 ```
 
-You choose a **password** (at least 10 characters) and a **recovery PIN** (6 to 12 digits). Neither is stored: only
+You choose a **password** (at least **16 characters**; a long passphrase is easiest) and a **recovery PIN** (6 to 12 digits). Neither is stored: only
 keyed hashes are. The PIN is the only way to reset a forgotten password, and only from this machine.
 
 ### 3. Tell it about QIUI and the pod
@@ -112,13 +112,27 @@ qiui-server sync
 ### 4. Run the server
 
 ```
-qiui-server serve                       # http://127.0.0.1:8443, this machine only
+qiui-server serve                       # listens on http://0.0.0.0:8443: every network interface
 ```
 
-The server speaks plain HTTP and refuses to bind a public address unless you pass `--allow-remote`. Phones need
-HTTPS (the web app and Bluetooth in the browser both require it), so put a TLS front in front of it. With
-Tailscale, `tailscale serve` will publish `127.0.0.1:8443` over HTTPS on your tailnet (check Tailscale's docs for
-the exact command for your version); a Cloudflare Tunnel also works.
+By default the server listens on **every network interface, in plain HTTP** (`--bind` changes that). It prints a note
+saying so when it starts. That suits reaching it two ways:
+
+- **On your LAN:** `http://<this machine's LAN address>:8443`, straight to the server.
+- **From anywhere else:** your Tailscale address, through whatever already serves HTTPS on your tailnet, pointed at
+  `127.0.0.1:8443` (or any address the server can be reached on). A Cloudflare Tunnel would also work.
+
+**Know what each address gives the wearer.** The browser only allows service workers, installing the app, notifications
+and Web Bluetooth on a secure address (HTTPS, or `localhost`). I measured this: on a plain `http://` address the app
+pairs, requests, unlocks through the server and shows the countdown, but **cannot install, start offline, send
+notifications or use the phone's Bluetooth**. So the LAN address gets the core flow, and the HTTPS address gets
+everything. The wearer can use the HTTPS address at home too, if Tailscale is on: it connects directly over your
+LAN. Each address is a separate app to the browser (its own stored login), so the phone pairs once per address, which is
+why up to two devices may be paired by default (see below).
+
+**Plain HTTP on the LAN is not encrypted.** The keyholder password and the wearer's token cross your home network in the
+clear on that path, readable by anything else on it. Keyholder work is safest done with the CLI on the server itself
+or through the HTTPS address.
 
 **Trying it without a pod.** `qiui-server serve --simulate-pod` runs the whole thing against a pretend pod that is
 always in range and always obeys (add `--simulate-out-of-range` to make the phone's Bluetooth the only way in). It
@@ -140,8 +154,12 @@ receive notifications.
 qiui-server pairing-code
 ```
 
-(It asks for your password.) Read the code to the wearer. It works once, for 10 minutes, and a new code replaces it. Only **one device** can be
-paired at a time; to swap phones, `qiui-server devices` then `qiui-server revoke-device <id>` first.
+(It asks for your password.) Read the code to the wearer. It works once, for 10 minutes, and a new code replaces it.
+
+**Up to two devices can be paired at once by default**, so one phone can be paired on the LAN address and on the
+Tailscale address (each is a separate app to the browser). Change the limit, 1 to 5, with
+`qiui-server config set-max-devices N`; it takes effect immediately. A pairing beyond the limit is refused until you
+`qiui-server devices` and `qiui-server revoke-device <id>` one. Every pairing still needs a code from you.
 
 ---
 
@@ -161,7 +179,7 @@ works immediately, however many wrong ones came before it.
 |---|---|
 | `status`, `approve`, `deny`, `lock`, `unlock`, `sync`, `timer …`, `queue …`, `message`, `audit` | `--password` |
 | `pairing-code`, `devices`, `revoke-device` | `--password` |
-| every `config …` command (`show`, `set-client-id`, `set-api-key`, `set-mac`, `set-push-contact`, `import-env`, `encrypt`) | `--password`; the credentials are also encrypted under it |
+| every `config …` command (`show`, `set-client-id`, `set-api-key`, `set-mac`, `set-push-contact`, `set-max-devices`, `import-env`, `encrypt`) | `--password`; the credentials are also encrypted under it |
 | `reset-password` | The recovery route: `--pin` and `--new-password`, no password |
 | `init` | Only works before an account exists, so there is no password yet: `--password` is the **new** one, and `--pin` the new recovery PIN |
 | `serve`, `identify` | none. `serve` only starts the process (pod control stays locked until you sign in), and `identify` just scans Bluetooth and touches nothing |
@@ -188,10 +206,10 @@ With no terminal and no `QIUI_KEYHOLDER_PASSWORD` set, a command that needs the 
 | `timer pause` / `resume` / `clear` | Freeze, restart or remove the timer |
 | `queue lock` / `queue unlock` / `queue cancel` | Have a command carried out the next time the pod can be reached |
 | `message "text"` | Send the wearer a message (up to 1000 characters) |
-| `audit [--limit N]` | The audit log, newest first |
+| `audit [--limit N]` | The audit log, newest first, with any failed attempts still pending a summary row shown at the top |
 | `pairing-code`, `devices`, `revoke-device <id>` | Manage the wearer's device |
 | `reset-password` | Reset the password with the recovery PIN |
-| `config …` | `show`, `set-client-id`, `set-api-key`, `set-mac`, `set-push-contact`, `import-env`, `encrypt` |
+| `config …` | `show`, `set-client-id`, `set-api-key`, `set-mac`, `set-push-contact`, `set-max-devices`, `import-env`, `encrypt` |
 
 `lock`, `unlock` and `sync` also work with the server **stopped**: the CLI then talks to the pod directly, applying
 the same rules. That is your fallback if the server is down. Because the QIUI credentials are encrypted, this
@@ -259,13 +277,15 @@ Two events deserve attention:
 | `control_lost` | system | QIUI says the pod is now bound outside this server |
 | `message_sent` | keyholder | You sent a message (its id, not its text) |
 | `login`, `password_changed` | keyholder | Sign-ins and password changes |
-| `login_failed`, `pairing_failed`, `password_reset_failed` | system or local-cli | A wrong password, pairing code or recovery PIN. Runs of them are summarised: one row per route per 30 seconds, with `suppressed` counting the ones folded in |
+| `login_failed`, `pairing_failed`, `password_change_failed`, `password_reset_failed`, `login_busy`, `password_change_busy` | system or local-cli | A wrong password, pairing code, current password on a password change, or recovery PIN; and (`…_busy`) attempts the server was too busy to even check. **Each route counts on its own**: the command line's password, the API's login, pairing codes, password changes and the PIN, so a flood on one never hides another. **The first failure in a 30-second window gets its own row at once** (`suppressed: 0`). The rest of that window are counted, shown in `audit` immediately as *pending*, and written as one summary row (`summary: true`, with the count) within about 35 seconds, even if nothing else fails afterwards |
 | `keyholder_initialised`, `password_reset` | local-cli | Account setup and recovery-PIN resets |
-| `pairing_code_created`, `device_revoked` | keyholder or local-cli | Managing the wearer's device |
+| `pairing_code_created`, `device_revoked` | keyholder or local-cli | Managing the wearer's devices |
+| `max_devices_changed` | local-cli | The paired-device limit was changed |
 | `device_paired` | wearer | The wearer paired a device |
 | `push_subscribed`, `push_unsubscribed` | wearer | Notifications turned on or off |
 | `credentials_sealed`, `credentials_cleared` | local-cli | The QIUI credentials were stored encrypted, or removed after a PIN reset |
 | `credentials_unlocked`, `credentials_unlock_failed` | system | They were decrypted at sign-in, or could not be |
+| `kdf_upgraded` | system | A password hash, or the sealed QIUI credentials, was re-made under stronger settings at sign-in |
 | `credentials_reseal_failed` | system | A password change could not re-encrypt them; re-enter them with `config set-client-id` |
 | `platform_token_failed`, `platform_token_recovered` | system | QIUI's 12-hour token could not be renewed, or renewal works again |
 
@@ -369,7 +389,8 @@ keyholder queued a lock or unlock while you were out of range, a card offers **C
 
 ### Notifications
 
-When the server has notifications set up, the app offers **Turn on notifications**. You are then told when your
+When the server has notifications set up, the app offers **Turn on notifications** (on the HTTPS address only: the browser
+does not allow them on plain HTTP). You are then told when your
 keyholder approves or turns down a request, sends a message (the text is shown, so it can appear on your lock
 screen), starts, extends, pauses or clears a timer, or queues a command, and when a timer finishes. Things you did yourself
 are never notified.
@@ -396,7 +417,24 @@ wearer token is refused on every keyholder route (a test tries each one).
 **Secrets.** Passwords and the recovery PIN are Argon2id hashes keyed with a *pepper* stored outside the database;
 session tokens and pairing codes are stored only as SHA-256 hashes. A copied database reveals none of them. Back
 up `pepper.key` together with the database, or every stored hash becomes unverifiable. Failed logins, PIN guesses
-and pairing guesses are never locked out or delayed, so a strong password matters: the only cost to a guesser is the password hash's own work (a fraction of a second per guess). Failures are still logged, summarised to one row per 30 seconds with a count so guessing cannot flood the log.
+and pairing guesses are never locked out. What slows a guesser is the cost of each check, tuned for that (next paragraph). Failures are still logged: the first in each 30-second window gets its own row at once, and the rest are counted (visible in `audit` immediately, then written as one summary row), so guessing cannot flood the log but is never hidden.
+
+**Password-check cost.** Every password, PIN and encryption key is derived with Argon2id at **128 MiB of memory, 3 passes,
+1 lane**: about 230 ms per check on an 8-core laptop. Because there is no lockout, this cost is the brake on guessing, so
+the server also protects itself and everyone else while someone guesses:
+
+- At most **two checks run at a time**, with a queue of 32 behind them. Anything beyond that gets "the server is busy,
+  try again", never a lockout. That caps a guesser at roughly **10 guesses a second** in total, however many connections
+  they open, and bounds memory at about 256 MiB.
+- Checks run **away from the database lock**, so a flood of guesses cannot slow the wearer's app or anything else
+  (measured: a wearer request took 1 ms with or without 40 connections guessing; with the older single check under the
+  lock it took 181 ms).
+- **Older hashes are upgraded automatically.** Hashes and sealed credentials record the settings they were made with, so
+  changing the cost never breaks anything: a right password re-hashes an older hash, and re-seals older credentials, at
+  the next sign-in (both are noted in the audit log as `kdf_upgraded`).
+
+To retune for other hardware, run `cargo run --release --example argon_bench`. It times several settings on the
+machine, and the constants are in `KdfParams` in `src/accounts.rs`.
 
 **The web app.** It is served with a strict Content-Security-Policy (no inline scripts or styles, and it may only talk to
 this server), and the device token lives in the browser's local storage. Push notification URLs come from the
@@ -416,11 +454,18 @@ controlled at all. The API key is stored the same way, though nothing currently 
   know the recovery PIN (which wipes the encrypted QIUI credentials, so the pod stays uncontrollable until you
   re-enter them). Root, or anything that can read the server's memory while it runs, can still see decrypted
   values. Treat the machine as keyholder-only.
-- **Nothing limits password guessing.** By your choice there is no lockout, so anyone who can reach the API (the
-  wearer, over your tailnet) can try passwords as fast as the server can check them, a few per second. That removes
-  the risk of being locked out of your own server, and leaves the strength of your password as the only protection:
-  use a long passphrase, not a short word. The recovery PIN is weaker still, but resetting needs a shell on the
-  server. Failures are logged, so a guessing run is visible in `audit`.
+- **The server listens in plain HTTP on every interface.** Anything on your LAN or tailnet can reach the keyholder login
+  and the API, and on the plain-HTTP paths passwords and tokens are readable by anyone else on that network. Use the
+  HTTPS address, or the CLI on the server, for keyholder work.
+- **Nothing locks guessing out, so the password's strength is the protection.** By your choice there is no lockout, so
+  anyone who can reach the API (the wearer, or any device on your LAN or tailnet) can keep trying passwords at about 10 a
+  second. That is far too slow for a long passphrase (16 or more characters is now required) and far too fast for a
+  short or common one: a list of the million most common passwords would take about 28 hours. Failures are logged, so a
+  guessing run is visible in `audit`. The recovery PIN is weaker still, but using it needs a shell on the server.
+- **A flood of guesses can crowd out your sign-in over the network.** While more than about 34 connections are guessing at
+  once, extra attempts, including yours, are answered "busy". It never locks you out and never slows anything else, and it
+  clears the moment the guessing stops. `lock`, `unlock` and `sync` run on the server machine fall back to talking to the
+  pod directly when this happens.
 - **Phone relay leaks unlock bytes to the wearer's phone.** Testing showed the bytes only work on the connection
   they were made for, and rarely on another (a few hundred possible states, so roughly a 1-in-several-hundred
   chance per reconnect for someone holding captured bytes). Exploiting that needs the wearer to extract the bytes
@@ -454,6 +499,9 @@ The evidence behind these statements is in [`RESEARCH.md`](../RESEARCH.md) §10.
 | Lock state looks wrong after the pod locked itself | The pod re-locks itself soon after opening. `lock` (keyholder) or the wearer's **Lock** button brings the record back in line |
 | `audit` warns the chain is broken | Rows were edited or deleted. Treat the log as untrustworthy from the first bad row |
 | No notifications | Check the app shows *notifications on* (not the offer), the browser allows them, and on iPhone that the app is on the Home Screen. Push has not been verified against a real push service yet |
+| "The server is busy checking passwords" (`busy`) | Something is guessing passwords faster than the server will check them. Wait a moment and try again; `lock`, `unlock` and `sync` on the server fall back to the direct route by themselves. Look for a run of `login_failed` in `audit` |
+| "The limit of paired devices has been reached" | Two devices are already paired. `qiui-server devices`, then `revoke-device <id>`, or raise the limit with `qiui-server config set-max-devices` |
+| The app works on the LAN address but cannot install or send notifications | That address is plain HTTP, and browsers only allow those features on HTTPS. Use the HTTPS address |
 | The app shows old data | It refreshes every 20 seconds and when opened. The circular arrows refresh it now. Offline, it shows what it last saw and says so |
 | Battery never shows | The KeyPod API reports 0, which we treat as "not reported" |
 
@@ -462,7 +510,7 @@ The evidence behind these statements is in [`RESEARCH.md`](../RESEARCH.md) §10.
 ## API reference
 
 All bodies are JSON. Errors look like `{"error": "…", "code": "…"}` (`code` appears for cases a client may want to
-branch on: `out_of_range`, `control_lost`, `pod_timeout`, `pod_error`, `cloud_error`, `relay_expired`, `push_unavailable`, `credentials_locked`). Every
+branch on: `out_of_range`, `control_lost`, `pod_timeout`, `pod_error`, `cloud_error`, `relay_expired`, `push_unavailable`, `credentials_locked`, `busy`). Every
 response carries `Cache-Control: no-store`. Authenticate with `Authorization: Bearer <token>`.
 
 ### Sign-in
@@ -476,7 +524,7 @@ response carries `Cache-Control: no-store`. Authenticate with `Authorization: Be
 
 | Path | Method | Body | Purpose |
 |---|---|---|---|
-| `state` | GET | | Lock, timer, approval, queue, pod info, paired device |
+| `state` | GET | | Lock, timer, approval, queue, pod info, and `paired_devices` (each with last-seen) |
 | `approve` | POST | `{"ttl_minutes"?}` (1 to 240) | Approve the request |
 | `deny` | POST | | Deny or revoke |
 | `unlock`, `lock` | POST | | Do it over the server's Bluetooth |
@@ -489,7 +537,7 @@ response carries `Cache-Control: no-store`. Authenticate with `Authorization: Be
 | `queue` | POST | `{"command": "lock"\|"unlock"}` | Queue a command |
 | `queue/cancel` | POST | | |
 | `messages` | POST | `{"body"}` | Message the wearer |
-| `audit?limit=N` | GET | | `{"chain_intact", "entries"}` |
+| `audit?limit=N` | GET | | `{"chain_intact", "entries", "pending_failures"}`. `pending_failures` lists failed attempts counted but not yet written as a summary row (`actor`, `kind`, `count`, `since_ms`) |
 | `pairing-code` | POST | | `{"code", "expires_ms"}` |
 | `devices` | GET | | Paired devices |
 | `devices/{id}/revoke` | POST | | Sign a device out |
@@ -521,7 +569,7 @@ The phone only carries bytes; the server drives the sequence and decides when a 
 3. `POST /api/wearer/relay/reply {"session_id", "hex": "<pod reply>"}`.
    - `{"done": false, "cmd": "…"}`: write this next (the unlock or lock bytes), then `reply` again with the pod's answer.
    - `{"done": true, …state}`: finished. **Disconnect now.**
-4. A session belongs to one device, lasts two minutes, and one device has at most one at a time.
+4. A session belongs to one device, lasts two minutes, and each device has at most one at a time.
 
 ### A complete wearer flow with curl
 
