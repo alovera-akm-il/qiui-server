@@ -140,6 +140,28 @@ impl PodLink for BlePod {
     }
 }
 
+/// Demo mode: a pod that always obeys, and is either always in range of the server or never.
+/// For trying the app out only.
+pub struct SimulatedPod {
+    pub in_range: bool,
+}
+
+#[async_trait]
+impl PodLink for SimulatedPod {
+    async fn run(&self, _cloud: &dyn Cloud, op: PodOp) -> Result<PodStatus, PodError> {
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        if !self.in_range {
+            return Err(PodError::NotInRange);
+        }
+        let comment_type = match op {
+            PodOp::Status => "01",
+            PodOp::Unlock => "02",
+            PodOp::Lock => "03",
+        };
+        Ok(PodStatus { battery: None, comment_type: comment_type.into(), is_unlocking: op == PodOp::Unlock })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

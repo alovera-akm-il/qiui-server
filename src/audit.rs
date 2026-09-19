@@ -81,6 +81,19 @@ pub fn entries(conn: &Connection, limit: u32) -> rusqlite::Result<Vec<Entry>> {
     .collect()
 }
 
+/// Rows after `after_id`, oldest first.
+pub fn entries_after(conn: &Connection, after_id: i64, limit: u32) -> rusqlite::Result<Vec<Entry>> {
+    let mut stmt = conn.prepare("SELECT id, ts_ms, actor, kind, detail FROM audit WHERE id > ?1 ORDER BY id LIMIT ?2")?;
+    stmt.query_map(params![after_id, limit], |r| {
+        Ok(Entry { id: r.get(0)?, ts_ms: r.get(1)?, actor: r.get(2)?, kind: r.get(3)?, detail: r.get(4)? })
+    })?
+    .collect()
+}
+
+pub fn latest_id(conn: &Connection) -> rusqlite::Result<i64> {
+    conn.query_row("SELECT COALESCE(MAX(id), 0) FROM audit", [], |r| r.get(0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

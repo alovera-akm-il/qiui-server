@@ -26,7 +26,7 @@ fn private_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn require_private(path: &Path) -> Result<()> {
+pub(crate) fn require_private(path: &Path) -> Result<()> {
     let mode = fs::metadata(path)?.permissions().mode() & 0o777;
     if mode & 0o077 != 0 {
         bail!("{} is accessible to other users (mode {mode:o}); run: chmod 600 {}", path.display(), path.display());
@@ -62,6 +62,8 @@ pub struct Config {
     pub client_id: Option<String>,
     pub api_key: Option<String>,
     pub mac: Option<String>,
+    /// `mailto:` or https address push services can reach if this server misbehaves.
+    pub push_contact: Option<String>,
 }
 
 pub fn load_config(root: &Path) -> Result<Config> {
@@ -129,7 +131,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         assert!(load_config(&dir).unwrap().client_id.is_none());
 
-        save_config(&dir, &Config { client_id: Some("Client_x".into()), api_key: None, mac: Some("AA:BB".into()) }).unwrap();
+        save_config(&dir, &Config { client_id: Some("Client_x".into()), api_key: None, mac: Some("AA:BB".into()), push_contact: None }).unwrap();
         assert_eq!(fs::metadata(dir.join("config.json")).unwrap().permissions().mode() & 0o777, 0o600);
         let back = load_config(&dir).unwrap();
         assert_eq!((back.client_id.as_deref(), back.mac.as_deref()), (Some("Client_x"), Some("AA:BB")));

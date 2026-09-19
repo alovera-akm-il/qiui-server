@@ -149,3 +149,25 @@ impl Cloud for UnconfiguredCloud {
         Self::err()
     }
 }
+
+/// Demo mode: answers like a healthy pod without any QIUI account or hardware.
+pub struct SimulatedCloud;
+
+#[async_trait]
+impl Cloud for SimulatedCloud {
+    async fn device_token_cmd(&self) -> Result<String, CloudError> {
+        Ok("5301".into())
+    }
+    async fn decrypt_reply(&self, reply_hex: &str) -> Result<PodStatus, CloudError> {
+        // A simulated pod answers a command "53xx" with a reply starting "xx":
+        // "01" handshake, "02" unlock, "03" lock.
+        let comment_type = if reply_hex.len() >= 2 { reply_hex[..2].to_string() } else { "01".into() };
+        Ok(PodStatus { battery: None, is_unlocking: comment_type == "02", comment_type })
+    }
+    async fn unlock_cmd(&self) -> Result<String, CloudError> {
+        Ok("5502".into())
+    }
+    async fn lock_cmd(&self) -> Result<String, CloudError> {
+        Ok("5503".into())
+    }
+}

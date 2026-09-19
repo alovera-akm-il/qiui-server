@@ -3,10 +3,12 @@
 A local server that lets a **keyholder** control a QIUI KeyPod worn by a **wearer**, with the rules enforced on the
 server rather than on the wearer's phone.
 
-> **What exists today.** The server, the keyholder command line, the HTTP API, Bluetooth control (through the
-> server, or relayed by the wearer's phone) and the audit log are built and tested. The wearer's installable web
-> app is **not built yet**: the phone screens in this guide are design mockups (rendered screenshots of the
-> designs), and the live app will replace them. Everything the app will do already works through the API.
+> **What exists today.** Everything described here is built and tested: the server, the keyholder command line, the
+> HTTP API, Bluetooth control (through the server or relayed by the wearer's phone), the audit log, the wearer's
+> installable web app and push notifications. Two things have not yet been run for real: the Rust Bluetooth path
+> against the actual pod (it is covered by tests with a fake pod), and push delivery through a real push service to a
+> real phone. The wearer screenshots below are taken from the running app against a **simulated** pod
+> (`--simulate-pod`), driven by an automated browser test.
 
 Contents: [How it works](#how-it-works) · [Setup](#setup) · [Keyholder guide](#keyholder-guide) ·
 [Wearer guide](#wearer-guide) · [Security model and limits](#security-model-and-limits) ·
@@ -104,11 +106,21 @@ HTTPS (the web app and Bluetooth in the browser both require it), so put a TLS f
 Tailscale, `tailscale serve` will publish `127.0.0.1:8443` over HTTPS on your tailnet (check Tailscale's docs for
 the exact command for your version); a Cloudflare Tunnel also works.
 
+**Trying it without a pod.** `qiui-server serve --simulate-pod` runs the whole thing against a pretend pod that is
+always in range and always obeys (add `--simulate-out-of-range` to make the phone's Bluetooth the only way in). It
+prints a warning and touches neither QIUI nor any hardware. It is what the screenshots in this guide were taken with.
+
 A typical always-on setup (not tested here): a systemd user service running `qiui-server serve`, `loginctl
 enable-linger $USER`, and the laptop configured not to suspend when the lid closes (`HandleLidSwitch=ignore` in
 `/etc/systemd/logind.conf`).
 
-### 5. Pair the wearer's device
+### 5. Open the wearer's app
+
+The app is served at the same address as the API. On the wearer's phone open the server's HTTPS address in the
+browser and choose **Add to Home Screen**. It then opens like an app, works offline for the countdown, and can
+receive notifications.
+
+### 6. Pair the wearer's device
 
 ```
 qiui-server pairing-code
@@ -202,16 +214,16 @@ keyholder session, and the reset is recorded in the audit log as `local-cli`.
 
 ## Wearer guide
 
-> The screens below are **design mockups**. The web app that implements them is the next piece of work.
+![One unlock cycle in the wearer's app](images/app-flow.gif)
 
-![The wearer's screens for one unlock cycle](images/wearer-flow.gif)
+*Locked, a timer running, the timer ending, a request, its approval, unlocked. Real screens from the app.*
 
 ### Installing and pairing
 
 Open the server's HTTPS address in the phone's browser, choose **Add to Home Screen**, then enter the pairing code
-the keyholder gives you.
+the keyholder gives you. A wrong code is refused with a message and counts toward a lockout.
 
-<img src="images/wearer-pair.png" alt="Pairing screen" width="260">
+<img src="images/app-pair.png" alt="Pairing screen" width="260">
 
 ### The button
 
@@ -227,38 +239,41 @@ The main button always says what is possible right now:
 | Unlocked | **Lock** | Ends the unlock; the pod also locks itself soon after opening |
 
 <p>
-<img src="images/wearer-locked.png" alt="Locked, no timer" width="200">
-<img src="images/wearer-timer-running.png" alt="Locked, timer running" width="200">
-<img src="images/wearer-request-sent.png" alt="Request sent" width="200">
-<img src="images/wearer-approved.png" alt="Approved" width="200">
+<img src="images/app-locked.png" alt="Locked, no timer" width="200">
+<img src="images/app-timer-running.png" alt="Locked, timer running" width="200">
+<img src="images/app-request-sent.png" alt="Request sent" width="200">
+<img src="images/app-approved.png" alt="Approved" width="200">
 </p>
 
 ### The timer and the sync button
 
 The countdown shows days, hours, minutes and seconds, whether the keyholder set an exact time or rolled a random
-one. The circular arrows at the top right refresh the app from the server; the "checked … ago" text says when the
-pod itself was last reached, because the pod can only be read over Bluetooth.
+one. It is drawn from the **server's clock**, so changing the phone's clock does nothing. The circular arrows at the
+top right refresh the app from the server and ask it to check the pod; "Pod checked … ago" says when the pod itself
+was last reached, because the pod can only be read over Bluetooth.
 
-If the phone goes offline the countdown keeps running from the last known end time, marked **unconfirmed**: the
-keyholder may have changed it since. Reaching zero offline only lets you *ask*; the request is sent when you
-reconnect and the server checks the timer itself.
+If the phone goes offline the countdown keeps running from the last reading, and if it reaches zero it is marked
+**Ended · unconfirmed**: the keyholder may have changed it since. You can still tap **Request unlock**; the request
+is held and sent when you reconnect, and the server checks the timer itself, so it is only accepted if the timer
+really ended.
 
 <p>
-<img src="images/wearer-timer-paused.png" alt="Timer paused" width="200">
-<img src="images/wearer-timer-ended.png" alt="Timer ended" width="200">
-<img src="images/wearer-offline.png" alt="Offline, timer unconfirmed" width="200">
+<img src="images/app-timer-paused.png" alt="Timer paused" width="200">
+<img src="images/app-timer-ended.png" alt="Timer ended" width="200">
+<img src="images/app-offline.png" alt="Offline, timer unconfirmed" width="200">
 </p>
 
 ### Unlocking: server or phone
 
 - **Pod within range of the server:** tapping **Unlock** opens it directly. Nothing to connect.
-- **Pod out of range:** the app uses **this phone's Bluetooth** instead. Hold the phone within a metre or two of
-  the pod and keep the screen open.
+- **Pod out of range:** the app says so and offers **Connect over Bluetooth**, which uses **this phone's Bluetooth**.
+  Hold the phone within a metre or two of the pod and keep the screen open. (It asks for a second tap because the
+  browser only allows a Bluetooth connection straight after a tap.) The phone disconnects as soon as the command is done.
 
 <p>
-<img src="images/wearer-unlocking-phone.png" alt="Unlocking over the phone's Bluetooth" width="200">
-<img src="images/wearer-no-bluetooth.png" alt="A browser without Bluetooth" width="200">
-<img src="images/wearer-unlocked.png" alt="Unlocked" width="200">
+<img src="images/app-relay-offer.png" alt="Offered the phone's Bluetooth" width="200">
+<img src="images/app-relay-progress.png" alt="Unlocking over the phone's Bluetooth" width="200">
+<img src="images/app-unlocked.png" alt="Unlocked" width="200">
 </p>
 
 | Phone | Unlock away from the server |
@@ -267,17 +282,39 @@ reconnect and the server checks the timer itself.
 | iPhone, Safari or Chrome | ✘. Apple gives every iOS browser an engine without Web Bluetooth |
 | iPhone, a Web Bluetooth browser app (for example *Bluetooth Browser*) | Probably; **not tested** |
 
-On a phone that cannot use Bluetooth you can still unlock whenever the pod is within range of the server.
+On a phone that cannot use Bluetooth the app says so, and you can still unlock whenever the pod is within range of
+the server.
 
-### Messages and queued commands
+<img src="images/app-no-bluetooth.png" alt="A browser without Bluetooth" width="200">
 
-Messages from the keyholder arrive as notifications (once the app exists). If the keyholder queued a lock or unlock
-while you were out of range, a card offers **Connect and apply**, and it cannot be dismissed.
+### Messages, activity and queued commands
+
+The **Messages** tab shows what the keyholder has sent. **Activity** tells the story of your lock: requests,
+approvals, timer changes, unlocks and locks, and who did each. It never shows how a random timer was rolled. If the
+keyholder queued a lock or unlock while you were out of range, a card offers **Connect and apply**.
 
 <p>
-<img src="images/wearer-messages.png" alt="Messages" width="200">
-<img src="images/wearer-queued-command.png" alt="A queued command" width="200">
+<img src="images/app-messages.png" alt="Messages" width="200">
+<img src="images/app-activity.png" alt="Activity" width="200">
+<img src="images/app-queued.png" alt="A queued command" width="200">
 </p>
+
+### Notifications
+
+When the server has notifications set up, the app offers **Turn on notifications**. You are then told when your
+keyholder approves or turns down a request, sends a message (the text is shown, so it can appear on your lock
+screen), starts, pauses or clears a timer, or queues a command, and when a timer finishes. Things you did yourself
+are never notified.
+
+<img src="images/app-notifications.png" alt="The notifications offer" width="200">
+
+- **Android, Chrome:** works from the browser or the installed app.
+- **iPhone (iOS 16.4 or later):** only from the app **added to the Home Screen** from Safari.
+- The server signs pushes with its own key (`vapid.key`) and encrypts each one for your phone, so the push service
+  (Google, Mozilla, Apple) cannot read them. Give push services a contact address with
+  `qiui-server config set-push-contact mailto:you@example.com`; Apple in particular can refuse pushes without one.
+- Delivery through a real push service has not been tried yet. If nothing arrives, the audit log and
+  `qiui-server serve`'s output are the places to look.
 
 ---
 
@@ -292,6 +329,11 @@ wearer token is refused on every keyholder route (a test tries each one).
 session tokens and pairing codes are stored only as SHA-256 hashes. A copied database reveals none of them. Back
 up `pepper.key` together with the database, or every stored hash becomes unverifiable. Failed logins, PIN guesses
 and pairing guesses lock out for growing periods.
+
+**The web app.** It is served with a strict Content-Security-Policy (no inline scripts or styles, and it may only talk to
+this server), and the device token lives in the browser's local storage. Push notification URLs come from the
+wearer's device, so the server only sends to https addresses on the known push services (Google, Mozilla, Apple,
+Microsoft) and never follows redirects; otherwise a wearer could aim the server at something inside your network.
 
 **Not protected:**
 
@@ -327,6 +369,8 @@ The evidence behind these statements is in [`RESEARCH.md`](../RESEARCH.md) §10.
 | `unlock` refused, "wrong state" | The wearer has not asked, or the approval lapsed |
 | Lock state looks wrong after the pod locked itself | The pod re-locks itself soon after opening. `lock` (keyholder) or the wearer's **Lock** button brings the record back in line |
 | `audit` warns the chain is broken | Rows were edited or deleted. Treat the log as untrustworthy from the first bad row |
+| No notifications | Check the app shows *notifications on* (not the offer), the browser allows them, and on iPhone that the app is on the Home Screen. Push has not been verified against a real push service yet |
+| The app shows old data | It refreshes every 20 seconds and when opened. The circular arrows refresh it now. Offline, it shows what it last saw and says so |
 | Battery never shows | The KeyPod API reports 0, which we treat as "not reported" |
 
 ---
@@ -334,7 +378,7 @@ The evidence behind these statements is in [`RESEARCH.md`](../RESEARCH.md) §10.
 ## API reference
 
 All bodies are JSON. Errors look like `{"error": "…", "code": "…"}` (`code` appears for cases a client may want to
-branch on: `out_of_range`, `control_lost`, `pod_timeout`, `pod_error`, `cloud_error`, `relay_expired`). Every
+branch on: `out_of_range`, `control_lost`, `pod_timeout`, `pod_error`, `cloud_error`, `relay_expired`, `push_unavailable`). Every
 response carries `Cache-Control: no-store`. Authenticate with `Authorization: Bearer <token>`.
 
 ### Sign-in
@@ -376,6 +420,10 @@ response carries `Cache-Control: no-store`. Authenticate with `Authorization: Be
 | `sync` | POST | Refresh pod info; rate-limited (`cooldown: true`) |
 | `messages` | GET | Messages, marked read |
 | `relay/start`, `relay/reply` | POST | Phone-relayed Bluetooth (below) |
+| `activity` | GET | The wearer's own story: requests, approvals, timer changes, unlocks, locks. Actor and route only, never details |
+| `push/key` | GET | The server's VAPID public key (`404 push_unavailable` if notifications are not set up) |
+| `push/subscribe` | POST | `{"endpoint","keys":{"p256dh","auth"}}`. Endpoint must be https on a known push service |
+| `push/unsubscribe` | POST | |
 
 ### Phone relay
 
@@ -416,7 +464,8 @@ The directory is mode 0700 and the files 0600; the server refuses to start if th
 |---|---|
 | `qiui.db` | SQLite: lock state, accounts, sessions, queue, messages, audit log (WAL mode) |
 | `pepper.key` | 32 random bytes that key the password hashes. Back it up with the database |
-| `config.json` | QIUI client id, API key, pod address |
+| `config.json` | QIUI client id, API key, pod address, push contact |
+| `vapid.key` | The server's push-signing key, created on first run |
 
 QIUI's 12-hour platform token is kept **in memory only** and renewed about 30 minutes before it expires (checked every
 10 minutes). QIUI returns the same token until it expires, so fetching again after a restart is equivalent, and no
@@ -429,3 +478,26 @@ live credential ever sits in the database. If renewal fails, `platform_token_fai
 | `QIUI_CLIENT_ID`, `QIUI_API_KEY` | `config set-client-id`, `config set-api-key` |
 | `QIUI_DATA_DIR` | Where the state lives |
 | `QIUI_SERVER` | Address the keyholder commands talk to (default `http://127.0.0.1:8443`) |
+
+---
+
+## Development
+
+```
+cargo test                          # the server: state machine, accounts, API, push, Bluetooth sessions (with fakes)
+node --test web/test                # the app's logic: countdown, button rules, the phone-relay loop
+```
+
+`scripts/e2e.mjs` runs the real server binary in demo mode and drives the real app in a real browser: pairing,
+requesting, approving, unlocking, the offline countdown, the phone-relay flow (with a fake Bluetooth radio), a
+browser without Bluetooth, and the notifications offer. It asserts what it sees and takes the screenshots in this
+guide.
+
+```
+cargo build
+npm i playwright-core
+CHROME=/path/to/chrome node scripts/e2e.mjs        # SHOTS_DIR=… to keep the screenshots
+```
+
+The wearer's app is plain JavaScript with no build step, in `web/`. It is compiled into the binary, so changing it
+means rebuilding.

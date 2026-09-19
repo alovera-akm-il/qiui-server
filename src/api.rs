@@ -37,15 +37,22 @@ pub struct AppState {
     pub store: Arc<Mutex<Store>>,
     pub auth: Arc<Auth>,
     pub hardware: Arc<Hardware>,
+    /// The VAPID public key, when push notifications are set up.
+    pub push_key: Option<String>,
     pub clock: Arc<dyn Fn() -> i64 + Send + Sync>,
 }
 
 impl AppState {
     pub fn new(store: Store, auth: Auth, hardware: Hardware) -> Self {
-        Self { store: Arc::new(Mutex::new(store)), auth: Arc::new(auth), hardware: Arc::new(hardware), clock: Arc::new(system_now_ms) }
+        Self { store: Arc::new(Mutex::new(store)), auth: Arc::new(auth), hardware: Arc::new(hardware), push_key: None, clock: Arc::new(system_now_ms) }
     }
 
-    fn now(&self) -> i64 {
+    pub fn with_push_key(mut self, key: String) -> Self {
+        self.push_key = Some(key);
+        self
+    }
+
+    pub(crate) fn now(&self) -> i64 {
         (self.clock)()
     }
 }
@@ -188,7 +195,7 @@ impl From<rusqlite::Error> for ApiError {
 type ApiResult = Result<Json<Value>, ApiError>;
 
 /// Run database work off the async threads: Argon2 is deliberately slow.
-async fn db<T, F>(st: &AppState, f: F) -> Result<T, ApiError>
+pub(crate) async fn db<T, F>(st: &AppState, f: F) -> Result<T, ApiError>
 where
     T: Send + 'static,
     F: FnOnce(&mut Store, &Auth, i64) -> Result<T, ApiError> + Send + 'static,
@@ -890,6 +897,90 @@ async fn command_reply(st: &AppState, id: &str, intent: Intent, status: PodStatu
     .await
 }
 
+
+// ---------- wearer: activity and push ----------
+
+/// What the wearer may see of the audit log: their own lock's story, never the keyholder's
+/// internals. Only the actor and how the pod was reached are exposed; no details, so a
+/// rolled timer's length can never leak through here.
+const ACTIVITY_KINDS: [&str; 19] = [
+    "unlock_requested",
+    "request_cancelled",
+    "request_denied",
+    "unlock_approved",
+    "approval_revoked",
+    "approval_expired",
+    "unlocked",
+    "locked",
+    "timer_set",
+    "timer_rolled",
+    "timer_paused",
+    "timer_resumed",
+    "timer_cleared",
+    "timer_ended",
+    "command_queued",
+    "command_cancelled",
+    "queued_command_done",
+    "queued_command_dropped",
+    "message_sent",
+];
+
+async fn wearer_activity(State(st): State<AppState>) -> ApiResult {
+    db(&st, |store, _, _| {
+        let entries: Vec<Value> = audit::entries(store.connection(), 400)?
+            .into_iter()
+            .filter(|e| ACTIVITY_KINDS.contains(&e.kind.as_str()))
+            .take(60)
+            .map(|e| {
+                let via = serde_json::from_str::<Value>(&e.detail).ok().and_then(|d| d["via"].as_str().map(str::to_owned));
+                json!({ "id": e.id, "ts_ms": e.ts_ms, "kind": e.kind, "by": e.actor, "via": via })
+            })
+            .collect();
+        Ok(Json(json!({ "activity": entries })))
+    })
+    .await
+}
+
+async fn push_key(State(st): State<AppState>) -> ApiResult {
+    match &st.push_key {
+        Some(k) => Ok(Json(json!({ "public_key": k }))),
+        None => Err(ApiError::coded(StatusCode::NOT_FOUND, "push_unavailable", "Notifications are not set up on this server.")),
+    }
+}
+
+#[derive(Deserialize)]
+struct PushKeys {
+    p256dh: String,
+    auth: String,
+}
+
+#[derive(Deserialize)]
+struct PushSubscribeReq {
+    endpoint: String,
+    keys: PushKeys,
+}
+
+async fn push_subscribe(State(st): State<AppState>, Extension(p): Extension<Principal>, Json(req): Json<PushSubscribeReq>) -> ApiResult {
+    let sub = crate::push::Subscription { device_id: device_id(&p)?, endpoint: req.endpoint, p256dh: req.keys.p256dh, auth: req.keys.auth };
+    crate::push::validate(&sub).map_err(ApiError::bad_request)?;
+    db(&st, move |store, _, now| {
+        crate::push::save_subscription(store.connection(), &sub, now)?;
+        store.log(now, "wearer", "push_subscribed", &json!({}))?;
+        Ok(Json(json!({ "subscribed": true })))
+    })
+    .await
+}
+
+async fn push_unsubscribe(State(st): State<AppState>, Extension(p): Extension<Principal>) -> ApiResult {
+    let device = device_id(&p)?;
+    db(&st, move |store, _, now| {
+        crate::push::delete_subscription(store.connection(), device)?;
+        store.log(now, "wearer", "push_unsubscribed", &json!({}))?;
+        Ok(Json(json!({ "subscribed": false })))
+    })
+    .await
+}
+
 // ---------- router ----------
 
 pub fn router(state: AppState) -> Router {
@@ -926,9 +1017,13 @@ pub fn router(state: AppState) -> Router {
         .route("/api/wearer/sync", post(wearer_sync))
         .route("/api/wearer/relay/start", post(relay_start))
         .route("/api/wearer/relay/reply", post(relay_reply))
+        .route("/api/wearer/activity", get(wearer_activity))
+        .route("/api/wearer/push/key", get(push_key))
+        .route("/api/wearer/push/subscribe", post(push_subscribe))
+        .route("/api/wearer/push/unsubscribe", post(push_unsubscribe))
         .layer(middleware::from_fn_with_state(state.clone(), require_wearer));
 
-    Router::new()
+    let api = Router::new()
         .route("/api/keyholder/login", post(keyholder_login))
         .route("/api/wearer/pair", post(wearer_pair))
         .merge(keyholder)
@@ -937,8 +1032,20 @@ pub fn router(state: AppState) -> Router {
         .layer(middleware::map_response(|mut r: Response| async move {
             r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
             r
-        }))
-        .with_state(state)
+        }));
+
+    // Everything that is not an API route is the wearer's web app (or a 404).
+    Router::new().merge(api).fallback(crate::web::serve).layer(middleware::map_response(security_headers)).with_state(state)
+}
+
+async fn security_headers(mut r: Response) -> Response {
+    let h = r.headers_mut();
+    h.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(crate::web::CONTENT_SECURITY_POLICY));
+    h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    h.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    h.insert("permissions-policy", HeaderValue::from_static("bluetooth=(self), camera=(), microphone=(), geolocation=()"));
+    r
 }
 
 #[cfg(test)]
@@ -951,7 +1058,7 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
-    use crate::fakes::{FakeCloud, FakePod};
+    use crate::fakes::{FakeCloud, FakePod, FakeSender};
 
     const PW: &str = "correct horse battery";
     const PIN: &str = "482913";
@@ -1088,6 +1195,10 @@ mod tests {
             ("POST", "/api/wearer/sync"),
             ("POST", "/api/wearer/relay/start"),
             ("POST", "/api/wearer/relay/reply"),
+            ("GET", "/api/wearer/activity"),
+            ("GET", "/api/wearer/push/key"),
+            ("POST", "/api/wearer/push/subscribe"),
+            ("POST", "/api/wearer/push/unsubscribe"),
         ] {
             let (s, _) = h.call(method, path, Some(&kh), Some(json!({}))).await;
             assert_eq!(s, StatusCode::FORBIDDEN, "keyholder token on {method} {path}");
@@ -1591,6 +1702,184 @@ mod tests {
         assert_eq!(h.pod.ops(), [PodOp::Unlock, PodOp::Lock]);
         assert!(!run_queue_once(&h.state).await, "nothing left to run");
     }
+
+    // ---------- activity and push ----------
+
+    fn good_subscription() -> Value {
+        use base64ct::{Base64UrlUnpadded, Encoding};
+        use web_push_native::p256::elliptic_curve::sec1::ToEncodedPoint;
+        let secret = web_push_native::p256::SecretKey::random(&mut web_push_native::p256::elliptic_curve::rand_core::OsRng);
+        json!({
+            "endpoint": "https://fcm.googleapis.com/fcm/send/abc123",
+            "keys": {
+                "p256dh": Base64UrlUnpadded::encode_string(secret.public_key().to_encoded_point(false).as_bytes()),
+                "auth": Base64UrlUnpadded::encode_string(&[3u8; 16]),
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn the_activity_feed_tells_the_wearers_story_without_leaking_internals() {
+        let h = harness();
+        let kh = h.keyholder().await;
+        let w = h.wearer(&kh).await;
+        h.call("POST", "/api/wearer/request-unlock", Some(&w), None).await;
+        h.call("POST", "/api/keyholder/approve", Some(&kh), Some(json!({}))).await;
+        h.call("POST", "/api/wearer/unlock", Some(&w), None).await;
+        h.call("POST", "/api/keyholder/timer/roll", Some(&kh), Some(json!({ "min_secs": 3600, "max_secs": 7200 }))).await;
+        h.call("POST", "/api/keyholder/messages", Some(&kh), Some(json!({ "body": "secret words" }))).await;
+
+        let (s, v) = h.call("GET", "/api/wearer/activity", Some(&w), None).await;
+        assert_eq!(s, StatusCode::OK);
+        let text = v.to_string();
+        let kinds: Vec<&str> = v["activity"].as_array().unwrap().iter().map(|e| e["kind"].as_str().unwrap()).collect();
+        for expected in ["unlock_requested", "unlock_approved", "unlocked", "timer_rolled"] {
+            assert!(kinds.contains(&expected), "{expected} missing from {kinds:?}");
+        }
+        for internal in ["login", "device_paired", "pairing_code_created", "relay_unlock_issued", "control_lost"] {
+            assert!(!kinds.contains(&internal), "{internal} must not be visible to the wearer");
+        }
+        assert!(!text.contains("chosen_ms") && !text.contains("min_ms") && !text.contains("3600"), "a rolled timer's length must not leak: {text}");
+        assert!(!text.contains("secret words"), "message text belongs in Messages, not Activity");
+        let unlocked = v["activity"].as_array().unwrap().iter().find(|e| e["kind"] == "unlocked").unwrap();
+        assert_eq!((unlocked["by"].as_str(), unlocked["via"].as_str()), (Some("wearer"), Some("server")));
+    }
+
+    #[tokio::test]
+    async fn push_subscriptions_are_validated_stored_and_removable() {
+        let h = harness();
+        let kh = h.keyholder().await;
+        let w = h.wearer(&kh).await;
+
+        // No key configured yet.
+        let (s, v) = h.call("GET", "/api/wearer/push/key", Some(&w), None).await;
+        assert_eq!((s, v["code"].as_str()), (StatusCode::NOT_FOUND, Some("push_unavailable")));
+
+        // A subscription that would make the server call something inside the network is refused.
+        let mut evil = good_subscription();
+        evil["endpoint"] = json!("https://127.0.0.1:8443/api/keyholder/state");
+        let (s, _) = h.call("POST", "/api/wearer/push/subscribe", Some(&w), Some(evil)).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert!(crate::push::active_subscription(h.state.store.lock().unwrap().connection()).unwrap().is_none());
+
+        let (s, _) = h.call("POST", "/api/wearer/push/subscribe", Some(&w), Some(good_subscription())).await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(crate::push::active_subscription(h.state.store.lock().unwrap().connection()).unwrap().is_some());
+
+        let (s, _) = h.call("POST", "/api/wearer/push/unsubscribe", Some(&w), None).await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(crate::push::active_subscription(h.state.store.lock().unwrap().connection()).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn the_notifier_tells_the_wearer_about_the_keyholders_actions_and_only_those() {
+        let h = harness();
+        let kh = h.keyholder().await;
+        let w = h.wearer(&kh).await;
+        h.call("POST", "/api/wearer/push/subscribe", Some(&w), Some(good_subscription())).await;
+        let sender = FakeSender::default();
+
+        // First pass only sets the cursor: history is not announced.
+        assert_eq!(crate::push::notify_once(&h.state, &sender).await, 0);
+
+        h.call("POST", "/api/wearer/request-unlock", Some(&w), None).await;            // the wearer's own act: silent
+        h.call("POST", "/api/keyholder/approve", Some(&kh), Some(json!({}))).await;     // told
+        h.call("POST", "/api/keyholder/messages", Some(&kh), Some(json!({ "body": "Back at 6." }))).await; // told, with text
+        assert_eq!(crate::push::notify_once(&h.state, &sender).await, 2);
+        let titles: Vec<String> = sender.sent().iter().map(|n| n["title"].as_str().unwrap().to_string()).collect();
+        assert_eq!(titles, ["Unlock approved", "Message from your keyholder"]);
+        assert_eq!(sender.sent()[1]["body"], "Back at 6.");
+
+        // Nothing new, nothing sent: no repeats.
+        assert_eq!(crate::push::notify_once(&h.state, &sender).await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_timer_ending_by_itself_is_noticed_and_pushed() {
+        let h = harness();
+        let kh = h.keyholder().await;
+        let w = h.wearer(&kh).await;
+        h.call("POST", "/api/wearer/push/subscribe", Some(&w), Some(good_subscription())).await;
+        let sender = FakeSender::default();
+        crate::push::notify_once(&h.state, &sender).await;
+
+        h.call("POST", "/api/keyholder/timer", Some(&kh), Some(json!({ "duration_secs": 3600 }))).await;
+        h.advance(2 * HOUR);
+        // Nobody has asked for state since; the worker itself has to notice time passing.
+        assert!(crate::push::notify_once(&h.state, &sender).await >= 2);
+        let titles: Vec<String> = sender.sent().iter().map(|n| n["title"].as_str().unwrap().to_string()).collect();
+        assert!(titles.contains(&"Timer started".to_string()), "{titles:?}");
+        assert!(titles.contains(&"Timer finished".to_string()), "{titles:?}");
+    }
+
+    #[tokio::test]
+    async fn a_subscription_the_push_service_says_is_gone_is_forgotten() {
+        let h = harness();
+        let kh = h.keyholder().await;
+        let w = h.wearer(&kh).await;
+        h.call("POST", "/api/wearer/push/subscribe", Some(&w), Some(good_subscription())).await;
+        let sender = FakeSender::default();
+        crate::push::notify_once(&h.state, &sender).await;
+
+        sender.set_gone();
+        h.call("POST", "/api/keyholder/messages", Some(&kh), Some(json!({ "body": "hello" }))).await;
+        assert_eq!(crate::push::notify_once(&h.state, &sender).await, 0);
+        assert!(crate::push::active_subscription(h.state.store.lock().unwrap().connection()).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_revoked_device_stops_receiving_notifications() {
+        let h = harness();
+        let kh = h.keyholder().await;
+        let w = h.wearer(&kh).await;
+        h.call("POST", "/api/wearer/push/subscribe", Some(&w), Some(good_subscription())).await;
+        let sender = FakeSender::default();
+        crate::push::notify_once(&h.state, &sender).await;
+
+        let (_, d) = h.call("GET", "/api/keyholder/devices", Some(&kh), None).await;
+        let id = d["devices"][0]["id"].as_i64().unwrap();
+        h.call("POST", &format!("/api/keyholder/devices/{id}/revoke"), Some(&kh), None).await;
+        h.call("POST", "/api/keyholder/messages", Some(&kh), Some(json!({ "body": "hello" }))).await;
+        assert_eq!(crate::push::notify_once(&h.state, &sender).await, 0);
+        assert!(sender.sent().is_empty());
+    }
+
+    // ---------- the web app ----------
+
+    #[tokio::test]
+    async fn the_app_is_served_with_a_strict_policy_and_the_api_still_answers_api_requests() {
+        let h = harness();
+        let req = |uri: &str| Request::builder().uri(uri).body(Body::empty()).unwrap();
+
+        let resp = h.app.clone().oneshot(req("/")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let headers = resp.headers().clone();
+        assert!(headers[header::CONTENT_TYPE].to_str().unwrap().starts_with("text/html"));
+        let csp = headers[header::CONTENT_SECURITY_POLICY].to_str().unwrap();
+        assert!(csp.contains("script-src 'self'") && csp.contains("frame-ancestors 'none'") && !csp.contains("unsafe-inline"));
+        assert_eq!(headers[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+        assert!(headers["permissions-policy"].to_str().unwrap().contains("bluetooth=(self)"));
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert!(String::from_utf8_lossy(&body).contains("<title>Tether</title>"));
+
+        for (path, mime) in [("/app.js", "javascript"), ("/sw.js", "javascript"), ("/app.css", "css"), ("/manifest.webmanifest", "manifest+json")] {
+            let r = h.app.clone().oneshot(req(path)).await.unwrap();
+            assert_eq!(r.status(), StatusCode::OK, "{path}");
+            assert!(r.headers()[header::CONTENT_TYPE].to_str().unwrap().contains(mime), "{path}");
+            assert_eq!(r.headers()[header::CACHE_CONTROL], "no-cache", "{path} must revalidate so updates are picked up");
+        }
+
+        // API routes are untouched: JSON, never cached, and unauthenticated calls still refused.
+        let r = h.app.clone().oneshot(req("/api/wearer/state")).await.unwrap();
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(r.headers()[header::CACHE_CONTROL], "no-store");
+
+        let r = h.app.clone().oneshot(req("/nothing-here")).await.unwrap();
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+        let r = h.app.clone().oneshot(req("/api/keyholder/nothing")).await.unwrap();
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+    }
+
 
     #[tokio::test]
     async fn oversized_bodies_are_rejected() {

@@ -4,10 +4,10 @@ A local server for QIUI KeyPods with two roles: a **keyholder** (command line an
 **wearer** (an installable web app, no password to leak). The server enforces the rules; the wearer's phone only
 asks.
 
-![The wearer's screens for one unlock cycle (design mockups)](docs/images/wearer-flow.gif)
+![One unlock cycle in the wearer's app](docs/images/app-flow.gif)
 
-*The wearer's app, as designed. The screens are mockups; the app itself is the next piece of work. Everything it
-will do already works through the API.*
+*The wearer's installable web app: locked, a timer running, the timer ending, a request, its approval, unlocked.
+Real screens, taken against the built-in demo pod.*
 
 ## What it does
 
@@ -16,6 +16,8 @@ will do already works through the API.*
   A finished timer only reopens requests.
 - **Works away from the server.** Over the server's Bluetooth when the pod is near, or relayed by the wearer's phone
   when it is not. The keyholder can queue a lock or unlock for the next time the pod can be reached.
+- **A web app for the wearer** that installs from the browser, keeps the countdown running offline, and sends
+  notifications.
 - **Short Bluetooth sessions.** Connect, run one command, disconnect.
 - **Everything is logged** in a tamper-evident audit log. Passwords are never stored; the database holds only keyed hashes.
 
@@ -42,9 +44,22 @@ every command is scriptable.
   troubleshooting, and the full API reference.
 - **[RESEARCH.md](RESEARCH.md)**: how QIUI's API and the pod actually behave, including live test results.
 
+## Try it without a pod
+
+```
+qiui-server init
+qiui-server serve --simulate-pod          # a pretend pod that is always in range
+```
+
+Open http://127.0.0.1:8443 in a browser, pair with `qiui-server pairing-code`, and drive the other side with the
+keyholder commands. Nothing touches QIUI or real hardware.
+
 ## Status
 
 Built and tested: accounts and pairing, lock state machine, timers, approvals, queue, audit log, keyholder CLI, HTTP
-API, Bluetooth control (server and phone relay). Bluetooth against the real pod has been exercised with the earlier
-Python scripts and a browser probe; the Rust Bluetooth path is covered by tests with a fake pod and still needs its
-first run against hardware. Still to build: the wearer's web app and push notifications.
+API, Bluetooth control (server and phone relay), the wearer's web app and push notifications. The app is exercised end
+to end in a real browser by `scripts/e2e.mjs`.
+
+Not yet run for real: the Rust Bluetooth path against the actual pod (it is covered by tests with a fake pod; the
+earlier Python scripts and a browser probe did talk to the pod), and push delivery through a real push service to a
+real phone.

@@ -13,11 +13,12 @@ use qiui_server::accounts::{self, AuthError};
 use qiui_server::api::{self, AppState, system_now_ms};
 use qiui_server::ble::{self, KNOWN_MAC, MAC_PREFIX};
 use qiui_server::client::{ENV_FILE, load_env};
-use qiui_server::cloud::{Cloud, QiuiCloud, UnconfiguredCloud};
+use qiui_server::cloud::{Cloud, QiuiCloud, SimulatedCloud, UnconfiguredCloud};
 use qiui_server::datadir::{self, Config};
 use qiui_server::hardware::Hardware;
 use qiui_server::machine::Actor;
-use qiui_server::pod::{BlePod, PodError, PodLink, PodOp};
+use qiui_server::pod::{BlePod, PodError, PodLink, PodOp, SimulatedPod};
+use qiui_server::push::{self, DEFAULT_CONTACT, HttpPushSender, Vapid};
 use qiui_server::store::{ApplyError, Store};
 
 #[derive(Parser)]
@@ -104,6 +105,12 @@ enum Action {
         /// Allow binding a non-loopback address. The server speaks plain HTTP; put it behind TLS (e.g. `tailscale serve`).
         #[arg(long)]
         allow_remote: bool,
+        /// DEMO ONLY: pretend the pod is always in range and obeys. No QIUI account or hardware is used.
+        #[arg(long)]
+        simulate_pod: bool,
+        /// With --simulate-pod: the pod is never in the server's range, so the phone's Bluetooth is used
+        #[arg(long, requires = "simulate_pod")]
+        simulate_out_of_range: bool,
     },
     /// Create the keyholder account (password and recovery PIN)
     Init {
@@ -172,6 +179,8 @@ enum ConfigCmd {
     },
     /// Set the pod's Bluetooth address
     SetMac { mac: String },
+    /// Set the contact address push services can use (mailto:you@example.com)
+    SetPushContact { contact: String },
     /// Import QIUI_CLIENT_ID / QIUI_PROD_API_KEY from an old .qiui_pod_env file
     ImportEnv { path: Option<PathBuf> },
 }
@@ -197,7 +206,9 @@ async fn main() -> Result<()> {
         }
         Action::Audit { limit, auth } => audit(&cli, auth, *limit).await,
         Action::Queue { cmd, auth } => queue(&cli, auth, cmd).await,
-        Action::Serve { bind, allow_remote } => serve(&cli, *bind, *allow_remote).await,
+        Action::Serve { bind, allow_remote, simulate_pod, simulate_out_of_range } => {
+            serve(&cli, *bind, *allow_remote, *simulate_pod, !*simulate_out_of_range).await
+        }
         Action::Init { password, pin } => init(&cli, password.clone(), pin.clone()),
         Action::ResetPassword { pin, new_password } => reset_password(&cli, pin.clone(), new_password.clone()),
         Action::PairingCode => pairing_code(&cli),
@@ -601,11 +612,13 @@ fn config(cli: &Cli, cmd: &ConfigCmd) -> Result<()> {
             println!("Client id       {}", cfg.client_id.as_deref().map(mask).unwrap_or_else(|| "not set".into()));
             println!("API key         {}", cfg.api_key.as_deref().map(mask).unwrap_or_else(|| "not set".into()));
             println!("Pod address     {}", cfg.mac.as_deref().unwrap_or("not set (using the built-in default)"));
+            println!("Push contact    {}", cfg.push_contact.as_deref().unwrap_or("not set (using a placeholder)"));
             return Ok(());
         }
         ConfigCmd::SetClientId { value } => cfg.client_id = Some(secret(value.clone(), "QIUI client id: ")?.trim().to_string()),
         ConfigCmd::SetApiKey { value } => cfg.api_key = Some(secret(value.clone(), "QIUI API key: ")?.trim().to_string()),
         ConfigCmd::SetMac { mac } => cfg.mac = Some(mac.trim().to_ascii_uppercase()),
+        ConfigCmd::SetPushContact { contact } => cfg.push_contact = Some(contact.trim().to_string()),
         ConfigCmd::ImportEnv { path } => {
             let env = load_env(path.clone().unwrap_or_else(|| PathBuf::from(ENV_FILE)))?;
             cfg.client_id = env.get("QIUI_CLIENT_ID").cloned().or(cfg.client_id);
@@ -619,7 +632,7 @@ fn config(cli: &Cli, cmd: &ConfigCmd) -> Result<()> {
 
 // ---------- server ----------
 
-async fn serve(cli: &Cli, bind: SocketAddr, allow_remote: bool) -> Result<()> {
+async fn serve(cli: &Cli, bind: SocketAddr, allow_remote: bool, simulate: bool, sim_in_range: bool) -> Result<()> {
     if !bind.ip().is_loopback() && !allow_remote {
         bail!("{bind} is not a loopback address and this server speaks plain HTTP. Bind 127.0.0.1 behind TLS (e.g. `tailscale serve`), or pass --allow-remote if you know what you are doing.");
     }
@@ -627,18 +640,35 @@ async fn serve(cli: &Cli, bind: SocketAddr, allow_remote: bool) -> Result<()> {
     if !accounts::is_initialised(store.connection())? {
         eprintln!("Note: no keyholder account yet. Run `qiui-server init` first.");
     }
-    let (_, cfg) = resolve_config(cli)?;
-    let (cloud, real_cloud, mac): (Arc<dyn Cloud>, Option<Arc<QiuiCloud>>, String) = match credentials(cli, &cfg) {
-        Some((client_id, mac)) => {
-            let c = Arc::new(QiuiCloud::new(&client_id, &mac, cli.debug));
-            (c.clone(), Some(c), mac)
-        }
-        None => {
-            eprintln!("Note: no QIUI client id configured, so the pod cannot be controlled yet. Run `qiui-server config set-client-id`.");
-            (Arc::new(UnconfiguredCloud), None, cli.mac.clone().unwrap_or_else(|| KNOWN_MAC.to_string()))
+    let (root, cfg) = resolve_config(cli)?;
+    let (cloud, pod, real_cloud, mac): (Arc<dyn Cloud>, Arc<dyn PodLink>, Option<Arc<QiuiCloud>>, String) = if simulate {
+        eprintln!("\n*** DEMO MODE: the pod is simulated. Nothing here touches a real pod or QIUI. ***\n");
+        (Arc::new(SimulatedCloud), Arc::new(SimulatedPod { in_range: sim_in_range }), None, "simulated".to_string())
+    } else {
+        match credentials(cli, &cfg) {
+            Some((client_id, mac)) => {
+                let c = Arc::new(QiuiCloud::new(&client_id, &mac, cli.debug));
+                (c.clone(), Arc::new(BlePod { mac: mac.clone(), debug: cli.debug }), Some(c), mac)
+            }
+            None => {
+                eprintln!("Note: no QIUI client id configured, so the pod cannot be controlled yet. Run `qiui-server config set-client-id`.");
+                let mac = cli.mac.clone().unwrap_or_else(|| KNOWN_MAC.to_string());
+                (Arc::new(UnconfiguredCloud), Arc::new(BlePod { mac: mac.clone(), debug: cli.debug }), None, mac)
+            }
         }
     };
-    let state = AppState::new(store, auth, Hardware::new(cloud, Arc::new(BlePod { mac: mac.clone(), debug: cli.debug })));
+
+    // Push notifications: the server's VAPID identity, and a worker that turns audit events into pushes.
+    let vapid = Arc::new(Vapid::load_or_create(&root)?);
+    let state = AppState::new(store, auth, Hardware::new(cloud, pod)).with_push_key(vapid.public_key().to_string());
+    let sender = HttpPushSender::new(vapid, cfg.push_contact.as_deref().unwrap_or(DEFAULT_CONTACT));
+    let push_state = state.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            push::notify_once(&push_state, &sender).await;
+        }
+    });
 
     // Carry out the keyholder's queued command as soon as the pod is in range.
     let queue_state = state.clone();
@@ -678,6 +708,7 @@ async fn serve(cli: &Cli, bind: SocketAddr, allow_remote: bool) -> Result<()> {
 
     let listener = tokio::net::TcpListener::bind(bind).await.with_context(|| format!("binding {bind}"))?;
     println!("Listening on http://{bind} for pod {mac}  (Ctrl-C to stop)");
+    println!("The wearer's app is served at the same address.");
     axum::serve(listener, api::router(state))
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;

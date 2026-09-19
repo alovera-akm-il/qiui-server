@@ -1,0 +1,16 @@
+{
+  "name": "Tether",
+  "short_name": "Tether",
+  "description": "Your lock, your keyholder's timer, and requests to be unlocked.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0f151b",
+  "theme_color": "#0f151b",
+  "icons": [
+    { "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "/icons/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

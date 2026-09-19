@@ -8,6 +8,7 @@ use async_trait::async_trait;
 
 use crate::cloud::{Cloud, CloudError};
 use crate::pod::{PodError, PodLink, PodOp, PodStatus, Transport};
+use crate::push::{PushError, PushSender, Subscription};
 
 #[derive(Default)]
 pub struct FakeCloud {
@@ -154,5 +155,34 @@ impl PodLink for FakePod {
             PodOp::Lock => "03",
         };
         Ok(PodStatus { battery: Some(0), comment_type: comment_type.into(), is_unlocking: op == PodOp::Unlock })
+    }
+}
+
+/// Collects what would have been pushed instead of contacting a push service.
+#[derive(Default)]
+pub struct FakeSender {
+    sent: Mutex<Vec<serde_json::Value>>,
+    gone: Mutex<bool>,
+}
+
+impl FakeSender {
+    pub fn sent(&self) -> Vec<serde_json::Value> {
+        self.sent.lock().unwrap().clone()
+    }
+
+    /// Make the "push service" answer that the subscription no longer exists.
+    pub fn set_gone(&self) {
+        *self.gone.lock().unwrap() = true;
+    }
+}
+
+#[async_trait]
+impl PushSender for FakeSender {
+    async fn send(&self, _sub: &Subscription, payload: &[u8]) -> Result<(), PushError> {
+        if *self.gone.lock().unwrap() {
+            return Err(PushError::Gone);
+        }
+        self.sent.lock().unwrap().push(serde_json::from_slice(payload).unwrap());
+        Ok(())
     }
 }

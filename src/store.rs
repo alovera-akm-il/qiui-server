@@ -52,6 +52,7 @@ impl Store {
         )?;
         audit::migrate(&conn)?;
         crate::queue::migrate(&conn)?;
+        crate::push::migrate(&conn)?;
         crate::accounts::migrate(&conn)?;
         Ok(Self { conn })
     }

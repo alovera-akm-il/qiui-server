@@ -441,6 +441,10 @@ pub fn add_message(conn: &Connection, body: &str, now_ms: i64) -> Result<i64> {
     Ok(conn.last_insert_rowid())
 }
 
+pub fn message_body(conn: &Connection, id: i64) -> Result<Option<String>> {
+    Ok(conn.query_row("SELECT body FROM messages WHERE id = ?1", [id], |r| r.get(0)).optional()?)
+}
+
 /// Newest first.
 pub fn list_messages(conn: &Connection, limit: u32) -> Result<Vec<Message>> {
     let mut stmt = conn.prepare("SELECT id, ts_ms, body, read_ms FROM messages ORDER BY id DESC LIMIT ?1")?;
