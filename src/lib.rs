@@ -1,6 +1,9 @@
+pub mod accounts;
+pub mod api;
 pub mod audit;
 pub mod ble;
 pub mod client;
+pub mod datadir;
 pub mod machine;
 pub mod store;
 pub mod timer;

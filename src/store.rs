@@ -45,6 +45,7 @@ impl Store {
             );",
         )?;
         audit::migrate(&conn)?;
+        crate::accounts::migrate(&conn)?;
         Ok(Self { conn })
     }
 
@@ -54,6 +55,11 @@ impl Store {
 
     pub fn machine(&self) -> rusqlite::Result<Machine> {
         load(&self.conn)
+    }
+
+    /// Record an event that is not a lock-state change (logins, pairing, password resets...).
+    pub fn log(&self, now_ms: i64, actor: &str, kind: &str, detail: &serde_json::Value) -> rusqlite::Result<()> {
+        audit::append(&self.conn, now_ms, actor, kind, &detail.to_string()).map(|_| ())
     }
 
     /// Run one action against the current state. Time-driven changes (timer
