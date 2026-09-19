@@ -24,3 +24,6 @@ target
 # Added by cargo
 
 /target
+
+# Local credentials
+.qiui_pod_env
