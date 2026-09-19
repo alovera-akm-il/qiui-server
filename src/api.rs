@@ -10,6 +10,7 @@
 use std::sync::{Arc, Mutex};
 
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
+use axum::Extension;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -18,9 +19,13 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::accounts::{self, Auth, AuthError, Role};
+use crate::accounts::{self, Auth, AuthError, Principal, Role};
 use crate::audit;
+use crate::cloud::CloudError;
+use crate::hardware::{Hardware, Intent, Stage};
 use crate::machine::{self, Actor, Machine};
+use crate::pod::{PodError, PodOp, PodStatus};
+use crate::queue::{self, Command, QueueError, Queued};
 use crate::store::{ApplyError, Store};
 use crate::timer::Timer;
 
@@ -31,12 +36,13 @@ const DEFAULT_APPROVAL_MINUTES: i64 = 15;
 pub struct AppState {
     pub store: Arc<Mutex<Store>>,
     pub auth: Arc<Auth>,
+    pub hardware: Arc<Hardware>,
     pub clock: Arc<dyn Fn() -> i64 + Send + Sync>,
 }
 
 impl AppState {
-    pub fn new(store: Store, auth: Auth) -> Self {
-        Self { store: Arc::new(Mutex::new(store)), auth: Arc::new(auth), clock: Arc::new(system_now_ms) }
+    pub fn new(store: Store, auth: Auth, hardware: Hardware) -> Self {
+        Self { store: Arc::new(Mutex::new(store)), auth: Arc::new(auth), hardware: Arc::new(hardware), clock: Arc::new(system_now_ms) }
     }
 
     fn now(&self) -> i64 {
@@ -54,12 +60,18 @@ pub fn system_now_ms() -> i64 {
 pub struct ApiError {
     status: StatusCode,
     message: String,
+    /// Stable machine-readable reason, e.g. "out_of_range", for clients that branch on it.
+    code: Option<&'static str>,
     retry_after_secs: Option<i64>,
 }
 
 impl ApiError {
     fn new(status: StatusCode, message: impl Into<String>) -> Self {
-        Self { status, message: message.into(), retry_after_secs: None }
+        Self { status, message: message.into(), code: None, retry_after_secs: None }
+    }
+
+    fn coded(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
+        Self { status, message: message.into(), code: Some(code), retry_after_secs: None }
     }
 
     fn internal(detail: impl std::fmt::Display) -> Self {
@@ -75,6 +87,9 @@ impl ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let mut body = json!({ "error": self.message });
+        if let Some(code) = self.code {
+            body["code"] = code.into();
+        }
         if let Some(secs) = self.retry_after_secs {
             body["retry_after_secs"] = secs.into();
         }
@@ -93,6 +108,7 @@ impl From<AuthError> for ApiError {
             AuthError::Locked { retry_after_ms } => Self {
                 status: StatusCode::TOO_MANY_REQUESTS,
                 message: e.to_string(),
+                code: None,
                 retry_after_secs: Some(retry_after_ms / 1000 + 1),
             },
             AuthError::NotInitialised => Self::new(StatusCode::SERVICE_UNAVAILABLE, "The keyholder account has not been set up yet."),
@@ -122,6 +138,45 @@ impl From<ApplyError> for ApiError {
             ApplyError::Db(d) => Self::internal(d),
         }
     }
+}
+
+fn control_lost() -> ApiError {
+    ApiError::coded(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "control_lost",
+        "The pod is no longer under this server's control. Its keyholder has been alerted.",
+    )
+}
+
+fn pod_error(e: PodError) -> ApiError {
+    match e {
+        PodError::NotInRange => ApiError::coded(StatusCode::CONFLICT, "out_of_range", e.to_string()),
+        PodError::ControlLost => control_lost(),
+        PodError::Timeout => ApiError::coded(StatusCode::GATEWAY_TIMEOUT, "pod_timeout", e.to_string()),
+        other => ApiError::coded(StatusCode::BAD_GATEWAY, "pod_error", other.to_string()),
+    }
+}
+
+fn cloud_error(e: CloudError) -> ApiError {
+    match e {
+        CloudError::BoundElsewhere => control_lost(),
+        CloudError::Other(m) => ApiError::coded(StatusCode::BAD_GATEWAY, "cloud_error", m),
+    }
+}
+
+/// Turn a pod failure into a response. Losing control of the pod is written to the audit log.
+async fn fail_pod(st: &AppState, e: PodError) -> ApiError {
+    if matches!(e, PodError::ControlLost) {
+        let _ = db(st, |store, _, now| Ok(store.log(now, "system", "control_lost", &json!({}))?)).await;
+    }
+    pod_error(e)
+}
+
+async fn fail_cloud(st: &AppState, e: CloudError) -> ApiError {
+    if e == CloudError::BoundElsewhere {
+        let _ = db(st, |store, _, now| Ok(store.log(now, "system", "control_lost", &json!({}))?)).await;
+    }
+    cloud_error(e)
 }
 
 impl From<rusqlite::Error> for ApiError {
@@ -160,15 +215,34 @@ fn timer_view(t: &Timer, now: i64) -> Value {
     }
 }
 
+/// When the pod was last reached and how. Battery is included only if the pod reported one.
+fn pod_view(p: Option<(i64, String, Option<i64>)>) -> Value {
+    let Some((checked_ms, via, battery)) = p else { return Value::Null };
+    let mut v = json!({ "checked_ms": checked_ms, "via": via });
+    if let Some(b) = battery {
+        v["battery"] = b.into();
+    }
+    v
+}
+
+fn queued_view(q: Option<Queued>) -> Value {
+    match q {
+        Some(q) => json!({ "command": q.command.as_str(), "queued_ms": q.queued_ms }),
+        None => Value::Null,
+    }
+}
+
 /// `server_time_ms` lets the app count down from the server's clock, not the phone's.
-fn state_view(m: &Machine, unread: i64, now: i64) -> Value {
-    json!({
+fn state_view(m: &Machine, store: &Store, now: i64) -> Result<Value, ApiError> {
+    Ok(json!({
         "server_time_ms": now,
         "lock": m.state.as_str(),
         "approval_expires_ms": m.approval_expires_ms,
         "timer": timer_view(&m.timer, now),
-        "unread_messages": unread,
-    })
+        "unread_messages": accounts::unread_count(store.connection())?,
+        "queued_command": queued_view(queue::pending(store.connection())?),
+        "pod": pod_view(store.pod_status()?),
+    }))
 }
 
 /// Apply time first (ending timers, expiring approvals) so a read never shows stale state.
@@ -179,12 +253,12 @@ fn current(store: &mut Store, now: i64) -> Result<Machine, ApiError> {
 
 fn wearer_state(store: &mut Store, now: i64) -> ApiResult {
     let m = current(store, now)?;
-    Ok(Json(state_view(&m, accounts::unread_count(store.connection())?, now)))
+    Ok(Json(state_view(&m, store, now)?))
 }
 
 fn keyholder_state(store: &mut Store, now: i64) -> ApiResult {
     let m = current(store, now)?;
-    let mut view = state_view(&m, accounts::unread_count(store.connection())?, now);
+    let mut view = state_view(&m, store, now)?;
     let device = accounts::list_devices(store.connection())?.into_iter().find(|d| d.revoked_ms.is_none());
     view["paired_device"] = match device {
         Some(d) => json!({ "id": d.id, "name": d.name, "paired_ms": d.paired_ms, "last_seen_ms": d.last_seen_ms }),
@@ -485,6 +559,337 @@ async fn kh_logout(State(st): State<AppState>, req: Request) -> ApiResult {
     .await
 }
 
+
+// ---------- pod control: server Bluetooth ----------
+
+/// Check the rules first (this also applies time), talk to the pod, then record what happened.
+async fn server_unlock(st: &AppState, actor: Actor) -> ApiResult {
+    db(st, move |store, _, now| {
+        store.apply(now, |m| m.check_unlock(actor, now).map(|()| Vec::new()))?;
+        Ok(())
+    })
+    .await?;
+    let status = st.hardware.direct(PodOp::Unlock).await;
+    finish_direct(st, actor, PodOp::Unlock, status).await
+}
+
+async fn server_lock(st: &AppState, actor: Actor) -> ApiResult {
+    db(st, move |store, _, now| {
+        store.apply(now, |m| m.check_lock(actor).map(|()| Vec::new()))?;
+        Ok(())
+    })
+    .await?;
+    let status = st.hardware.direct(PodOp::Lock).await;
+    finish_direct(st, actor, PodOp::Lock, status).await
+}
+
+async fn finish_direct(st: &AppState, actor: Actor, op: PodOp, result: Result<PodStatus, PodError>) -> ApiResult {
+    let status = match result {
+        Ok(s) => s,
+        Err(e) => return Err(fail_pod(st, e).await),
+    };
+    db(st, move |store, _, now| {
+        store.apply(now, |m| {
+            Ok(match op {
+                PodOp::Unlock => m.record_unlocked(actor, "server"),
+                _ => m.record_locked(actor, "server"),
+            })
+        })?;
+        store.save_pod_status(now, "server", status.battery)?;
+        state_for(store, actor, now)
+    })
+    .await
+}
+
+fn state_for(store: &mut Store, actor: Actor, now: i64) -> ApiResult {
+    if actor == Actor::Keyholder { keyholder_state(store, now) } else { wearer_state(store, now) }
+}
+
+/// Refresh what we know about the pod. Out of range is an answer, not an error.
+async fn server_sync(st: &AppState, actor: Actor) -> ApiResult {
+    if actor == Actor::Wearer && !st.hardware.sync_due(st.now()) {
+        return db(st, move |store, _, now| {
+            let mut view = state_for(store, actor, now)?;
+            view.0["in_range"] = Value::Null;
+            view.0["cooldown"] = true.into();
+            Ok(view)
+        })
+        .await;
+    }
+    let (in_range, battery) = match st.hardware.direct(PodOp::Status).await {
+        Ok(status) => (true, Some(status.battery)),
+        Err(PodError::NotInRange) => (false, None),
+        Err(e) => return Err(fail_pod(st, e).await),
+    };
+    db(st, move |store, _, now| {
+        if let Some(b) = battery {
+            store.save_pod_status(now, "server", b)?;
+        }
+        let mut view = state_for(store, actor, now)?;
+        view.0["in_range"] = in_range.into();
+        view.0["cooldown"] = false.into();
+        Ok(view)
+    })
+    .await
+}
+
+async fn wearer_unlock(State(st): State<AppState>) -> ApiResult {
+    server_unlock(&st, Actor::Wearer).await
+}
+
+async fn wearer_lock(State(st): State<AppState>) -> ApiResult {
+    server_lock(&st, Actor::Wearer).await
+}
+
+async fn wearer_sync(State(st): State<AppState>) -> ApiResult {
+    server_sync(&st, Actor::Wearer).await
+}
+
+async fn kh_unlock(State(st): State<AppState>) -> ApiResult {
+    server_unlock(&st, Actor::Keyholder).await
+}
+
+async fn kh_lock(State(st): State<AppState>) -> ApiResult {
+    server_lock(&st, Actor::Keyholder).await
+}
+
+async fn kh_sync(State(st): State<AppState>) -> ApiResult {
+    server_sync(&st, Actor::Keyholder).await
+}
+
+/// Write an event that has no request behind it (background workers).
+pub async fn audit_event(st: &AppState, actor: &'static str, kind: &'static str, detail: Value) {
+    let _ = db(st, move |store, _, now| Ok(store.log(now, actor, kind, &detail)?)).await;
+}
+
+// ---------- keyholder's queue ----------
+
+#[derive(Deserialize)]
+struct QueueReq {
+    command: String,
+}
+
+async fn kh_queue(State(st): State<AppState>, Json(req): Json<QueueReq>) -> ApiResult {
+    let command = Command::parse(&req.command).ok_or_else(|| ApiError::bad_request("command must be \"lock\" or \"unlock\""))?;
+    db(&st, move |store, _, now| {
+        match queue::enqueue(store.connection(), command, now) {
+            Ok(id) => store.log(now, "keyholder", "command_queued", &json!({ "id": id, "command": command.as_str() }))?,
+            Err(QueueError::AlreadyPending) => return Err(ApiError::new(StatusCode::CONFLICT, QueueError::AlreadyPending.to_string())),
+            Err(QueueError::Db(e)) => return Err(e.into()),
+        }
+        keyholder_state(store, now)
+    })
+    .await
+}
+
+async fn kh_queue_cancel(State(st): State<AppState>) -> ApiResult {
+    db(&st, |store, _, now| {
+        let Some(q) = queue::cancel(store.connection(), now)? else {
+            return Err(ApiError::new(StatusCode::NOT_FOUND, "Nothing is queued."));
+        };
+        store.log(now, "keyholder", "command_cancelled", &json!({ "id": q.id, "command": q.command.as_str() }))?;
+        keyholder_state(store, now)
+    })
+    .await
+}
+
+/// Try the keyholder's queued command over the server's Bluetooth. Returns true if it ran.
+/// Called on a timer; the rules are checked again now, so a queued unlock is dropped if a
+/// timer has started since.
+pub async fn run_queue_once(st: &AppState) -> bool {
+    let checked = db(st, |store, _, now| {
+        store.apply(now, |_| Ok(Vec::new()))?;
+        let Some(q) = queue::pending(store.connection())? else { return Ok(None) };
+        let m = store.machine()?;
+        let allowed = match q.command {
+            Command::Unlock => m.check_unlock(Actor::Keyholder, now),
+            Command::Lock => m.check_lock(Actor::Keyholder),
+        };
+        if let Err(reason) = allowed {
+            queue::finish(store.connection(), q.id, now, &format!("dropped: {reason}"))?;
+            store.log(now, "system", "queued_command_dropped", &json!({ "command": q.command.as_str(), "reason": reason.to_string() }))?;
+            return Ok(None);
+        }
+        Ok(Some(q))
+    })
+    .await;
+    let Ok(Some(q)) = checked else { return false };
+
+    let op = if q.command == Command::Unlock { PodOp::Unlock } else { PodOp::Lock };
+    let Ok(status) = st.hardware.direct(op).await else { return false };
+    db(st, move |store, _, now| {
+        store.apply(now, |m| {
+            Ok(if op == PodOp::Unlock { m.record_unlocked(Actor::Keyholder, "server") } else { m.record_locked(Actor::Keyholder, "server") })
+        })?;
+        queue::finish(store.connection(), q.id, now, "done via server")?;
+        store.log(now, "system", "queued_command_done", &json!({ "command": q.command.as_str(), "via": "server" }))?;
+        store.save_pod_status(now, "server", status.battery)?;
+        Ok(true)
+    })
+    .await
+    .unwrap_or(false)
+}
+
+// ---------- pod control: the wearer's phone relays Bluetooth ----------
+//
+// The phone only carries bytes. The server tells it what to write next, and it
+// mints an unlock or lock command only after the pod's handshake reply has been
+// decoded AND the rules still allow the action.
+
+#[derive(Deserialize)]
+struct RelayStartReq {
+    intent: String,
+}
+
+#[derive(Deserialize)]
+struct RelayReplyReq {
+    session_id: String,
+    hex: String,
+}
+
+fn device_id(p: &Principal) -> Result<i64, ApiError> {
+    p.device_id.ok_or_else(|| ApiError::new(StatusCode::FORBIDDEN, "This account cannot do that."))
+}
+
+fn valid_hex(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 256 && s.len() % 2 == 0 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// The rule that must hold for this intent, evaluated against the current state.
+fn intent_allowed(store: &mut Store, intent: Intent, now: i64) -> Result<(), ApiError> {
+    let m = current(store, now)?;
+    match intent {
+        Intent::Status => {}
+        Intent::Unlock => m.check_unlock(Actor::Wearer, now)?,
+        Intent::Lock => m.check_lock(Actor::Wearer)?,
+        Intent::Queued { command, queue_id } => {
+            match queue::pending(store.connection())? {
+                Some(q) if q.id == queue_id => {}
+                _ => return Err(ApiError::new(StatusCode::CONFLICT, "That queued command is no longer pending.")),
+            }
+            match command {
+                Command::Unlock => m.check_unlock(Actor::Keyholder, now)?,
+                Command::Lock => m.check_lock(Actor::Keyholder)?,
+            }
+        }
+    }
+    Ok(())
+}
+
+fn actor_for(intent: Intent) -> Actor {
+    if matches!(intent, Intent::Queued { .. }) { Actor::Keyholder } else { Actor::Wearer }
+}
+
+fn is_unlock(intent: Intent) -> bool {
+    matches!(intent, Intent::Unlock | Intent::Queued { command: Command::Unlock, .. })
+}
+
+async fn relay_start(State(st): State<AppState>, Extension(p): Extension<Principal>, Json(req): Json<RelayStartReq>) -> ApiResult {
+    let device = device_id(&p)?;
+    let intent = db(&st, move |store, _, now| {
+        let intent = match req.intent.as_str() {
+            "status" => Intent::Status,
+            "unlock" => Intent::Unlock,
+            "lock" => Intent::Lock,
+            "queued" => {
+                let q = queue::pending(store.connection())?.ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "Nothing is queued."))?;
+                Intent::Queued { command: q.command, queue_id: q.id }
+            }
+            _ => return Err(ApiError::bad_request("intent must be status, unlock, lock or queued")),
+        };
+        intent_allowed(store, intent, now)?;
+        Ok(intent)
+    })
+    .await?;
+
+    let cmd = match st.hardware.cloud.device_token_cmd().await {
+        Ok(c) => c,
+        Err(e) => return Err(fail_cloud(&st, e).await),
+    };
+    let session_id = st.hardware.start_relay(device, intent, st.now());
+    Ok(Json(json!({ "session_id": session_id, "cmd": cmd })))
+}
+
+async fn relay_reply(State(st): State<AppState>, Extension(p): Extension<Principal>, Json(req): Json<RelayReplyReq>) -> ApiResult {
+    let device = device_id(&p)?;
+    if !valid_hex(&req.hex) {
+        return Err(ApiError::bad_request("hex must be an even number of hexadecimal digits"));
+    }
+    let gone = || ApiError::coded(StatusCode::GONE, "relay_expired", "That Bluetooth session has expired. Start again.");
+    let relay = st.hardware.relay(&req.session_id, device, st.now()).ok_or_else(gone)?;
+
+    let status = match st.hardware.cloud.decrypt_reply(&req.hex).await {
+        Ok(s) => s,
+        Err(e) => {
+            st.hardware.end_relay(&req.session_id);
+            return Err(fail_cloud(&st, e).await);
+        }
+    };
+
+    match relay.stage {
+        Stage::Handshake => handshake_reply(&st, &req.session_id, device, relay.intent, status).await,
+        Stage::Command => command_reply(&st, &req.session_id, relay.intent, status).await,
+    }
+}
+
+async fn handshake_reply(st: &AppState, id: &str, device: i64, intent: Intent, status: PodStatus) -> ApiResult {
+    if intent == Intent::Status {
+        st.hardware.end_relay(id);
+        return db(st, move |store, _, now| {
+            store.save_pod_status(now, "phone", status.battery)?;
+            let mut view = wearer_state(store, now)?;
+            view.0["done"] = true.into();
+            Ok(view)
+        })
+        .await;
+    }
+
+    // The action may have stopped being allowed while the phone was connecting.
+    let allowed = db(st, move |store, _, now| intent_allowed(store, intent, now)).await;
+    if let Err(e) = allowed {
+        st.hardware.end_relay(id);
+        return Err(e);
+    }
+
+    let minted = if is_unlock(intent) { st.hardware.cloud.unlock_cmd().await } else { st.hardware.cloud.lock_cmd().await };
+    let cmd = match minted {
+        Ok(c) => c,
+        Err(e) => {
+            st.hardware.end_relay(id);
+            return Err(fail_cloud(st, e).await);
+        }
+    };
+    if is_unlock(intent) {
+        // The unlock bytes are now on the wearer's phone. Say so in the log.
+        db(st, move |store, _, now| Ok(store.log(now, "system", "relay_unlock_issued", &json!({ "device_id": device }))?)).await?;
+    }
+    st.hardware.advance_relay(id);
+    Ok(Json(json!({ "done": false, "cmd": cmd })))
+}
+
+async fn command_reply(st: &AppState, id: &str, intent: Intent, status: PodStatus) -> ApiResult {
+    st.hardware.end_relay(id);
+    let expected = if is_unlock(intent) { "02" } else { "03" };
+    if status.comment_type != expected {
+        return Err(ApiError::coded(StatusCode::BAD_GATEWAY, "pod_error", PodError::Unexpected.to_string()));
+    }
+    let actor = actor_for(intent);
+    db(st, move |store, _, now| {
+        store.apply(now, |m| {
+            Ok(if is_unlock(intent) { m.record_unlocked(actor, "phone") } else { m.record_locked(actor, "phone") })
+        })?;
+        if let Intent::Queued { command, queue_id } = intent {
+            queue::finish(store.connection(), queue_id, now, "done via phone")?;
+            store.log(now, "system", "queued_command_done", &json!({ "command": command.as_str(), "via": "phone" }))?;
+        }
+        store.save_pod_status(now, "phone", status.battery)?;
+        let mut view = wearer_state(store, now)?;
+        view.0["done"] = true.into();
+        Ok(view)
+    })
+    .await
+}
+
 // ---------- router ----------
 
 pub fn router(state: AppState) -> Router {
@@ -504,6 +909,11 @@ pub fn router(state: AppState) -> Router {
         .route("/api/keyholder/devices/{id}/revoke", post(kh_revoke_device))
         .route("/api/keyholder/password", post(kh_change_password))
         .route("/api/keyholder/logout", post(kh_logout))
+        .route("/api/keyholder/unlock", post(kh_unlock))
+        .route("/api/keyholder/lock", post(kh_lock))
+        .route("/api/keyholder/sync", post(kh_sync))
+        .route("/api/keyholder/queue", post(kh_queue))
+        .route("/api/keyholder/queue/cancel", post(kh_queue_cancel))
         .layer(middleware::from_fn_with_state(state.clone(), require_keyholder));
 
     let wearer = Router::new()
@@ -511,6 +921,11 @@ pub fn router(state: AppState) -> Router {
         .route("/api/wearer/request-unlock", post(wearer_request_unlock))
         .route("/api/wearer/cancel-request", post(wearer_cancel_request))
         .route("/api/wearer/messages", get(wearer_messages))
+        .route("/api/wearer/unlock", post(wearer_unlock))
+        .route("/api/wearer/lock", post(wearer_lock))
+        .route("/api/wearer/sync", post(wearer_sync))
+        .route("/api/wearer/relay/start", post(relay_start))
+        .route("/api/wearer/relay/reply", post(relay_reply))
         .layer(middleware::from_fn_with_state(state.clone(), require_wearer));
 
     Router::new()
@@ -536,6 +951,7 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+    use crate::fakes::{FakeCloud, FakePod};
 
     const PW: &str = "correct horse battery";
     const PIN: &str = "482913";
@@ -545,6 +961,9 @@ mod tests {
     struct Harness {
         app: Router,
         now: Arc<AtomicI64>,
+        pod: Arc<FakePod>,
+        cloud: Arc<FakeCloud>,
+        state: AppState,
     }
 
     fn harness() -> Harness {
@@ -553,9 +972,11 @@ mod tests {
         accounts::init_keyholder(store.connection(), &auth, PW, PIN).unwrap();
         let now = Arc::new(AtomicI64::new(1_000_000));
         let clock = now.clone();
-        let mut state = AppState::new(store, auth);
+        let pod = Arc::new(FakePod::default());
+        let cloud = Arc::new(FakeCloud::default());
+        let mut state = AppState::new(store, auth, Hardware::new(cloud.clone(), pod.clone()));
         state.clock = Arc::new(move || clock.load(Ordering::SeqCst));
-        Harness { app: router(state), now }
+        Harness { app: router(state.clone()), now, pod, cloud, state }
     }
 
     impl Harness {
@@ -645,6 +1066,11 @@ mod tests {
             ("POST", "/api/keyholder/devices/1/revoke"),
             ("POST", "/api/keyholder/password"),
             ("POST", "/api/keyholder/logout"),
+            ("POST", "/api/keyholder/unlock"),
+            ("POST", "/api/keyholder/lock"),
+            ("POST", "/api/keyholder/sync"),
+            ("POST", "/api/keyholder/queue"),
+            ("POST", "/api/keyholder/queue/cancel"),
         ];
         for (method, path) in keyholder_routes {
             let (s, _) = h.call(method, path, Some(&w), Some(json!({}))).await;
@@ -654,9 +1080,20 @@ mod tests {
             let (s, _) = h.call(method, path, Some("0000"), Some(json!({}))).await;
             assert_eq!(s, StatusCode::UNAUTHORIZED, "junk token on {method} {path}");
         }
-        // And the keyholder token is not a wearer token.
-        let (s, _) = h.call("GET", "/api/wearer/state", Some(&kh), None).await;
-        assert_eq!(s, StatusCode::FORBIDDEN);
+        // And the keyholder token is not a wearer token, on any wearer route.
+        for (method, path) in [
+            ("GET", "/api/wearer/state"),
+            ("POST", "/api/wearer/unlock"),
+            ("POST", "/api/wearer/lock"),
+            ("POST", "/api/wearer/sync"),
+            ("POST", "/api/wearer/relay/start"),
+            ("POST", "/api/wearer/relay/reply"),
+        ] {
+            let (s, _) = h.call(method, path, Some(&kh), Some(json!({}))).await;
+            assert_eq!(s, StatusCode::FORBIDDEN, "keyholder token on {method} {path}");
+        }
+        assert!(h.pod.ops().is_empty(), "nothing the wearer tried may have touched the pod");
+        assert!(h.cloud.calls().is_empty());
 
         // Nothing the wearer tried changed the lock.
         let (_, s) = h.call("GET", "/api/keyholder/state", Some(&kh), None).await;
@@ -812,6 +1249,347 @@ mod tests {
             assert!(kinds.contains(&expected), "missing {expected} in {kinds:?}");
         }
         assert_eq!(kinds.iter().filter(|k| **k == "unlock_approved").count(), 1);
+    }
+
+    // ---------- hardware ----------
+
+    impl Harness {
+        /// Wearer has asked and the keyholder has approved: the state in which unlocking is allowed.
+        async fn approved(&self, kh: &str, w: &str) {
+            self.call("POST", "/api/wearer/request-unlock", Some(w), None).await;
+            let (s, v) = self.call("POST", "/api/keyholder/approve", Some(kh), Some(json!({}))).await;
+            assert_eq!(s, StatusCode::OK, "{v}");
+        }
+
+        async fn audit_kinds(&self, kh: &str) -> Vec<String> {
+            let (_, a) = self.call("GET", "/api/keyholder/audit?limit=200", Some(kh), None).await;
+            a["entries"].as_array().unwrap().iter().map(|e| e["kind"].as_str().unwrap().to_string()).collect()
+        }
+
+        async fn lock_state(&self, kh: &str) -> String {
+            let (_, v) = self.call("GET", "/api/keyholder/state", Some(kh), None).await;
+            v["lock"].as_str().unwrap().to_string()
+        }
+    }
+
+    #[tokio::test]
+    async fn the_wearer_unlocks_and_locks_over_the_servers_bluetooth_only_after_approval() {
+        let h = harness();
+        let kh = h.keyholder().await;
+        let w = h.wearer(&kh).await;
+
+        // No approval, no contact with the pod.
+        let (s, _) = h.call("POST", "/api/wearer/unlock", Some(&w), None).await;
+        assert_eq!(s, StatusCode::CONFLICT);
+        h.call("POST", "/api/wearer/request-unlock", Some(&w), None).await;
+        let (s, _) = h.call("POST", "/api/wearer/unlock", Some(&w), None).await;
+        assert_eq!(s, StatusCode::CONFLICT);
+        assert!(h.pod.ops().is_empty());
+
+        h.call("POST", "/api/keyholder/approve", Some(&kh), Some(json!({}))).await;
+        let (s, v) = h.call("POST", "/api/wearer/unlock", Some(&w), None).await;
+        assert_eq!((s, v["lock"].as_str()), (StatusCode::OK, Some("unlocked")));
+        assert_eq!(h.pod.ops(), [PodOp::Unlock]);
+        assert_eq!(v["pod"]["via"], "server");
+
+        // The approval was used up: unlocking again needs a fresh one.
+        let (s, _) = h.call("POST", "/api/wearer/unlock", Some(&w), None).await;
+        assert_eq!(s, StatusCode::CONFLICT);
+        assert_eq!(h.pod.ops(), [PodOp::Unlock]);
+
+        let (s, v) = h.call("POST", "/api/wearer/lock", Some(&w), None).await;
+        assert_eq!((s, v["lock"].as_str()), (StatusCode::OK, Some("locked")));
+        assert_eq!(h.pod.ops(), [PodOp::Unlock, PodOp::Lock]);
+        let (s, _) = h.call("POST", "/api/wearer/unlock", Some(&w), None).await;
+        assert_eq!(s, StatusCode::CONFLICT, "locking again does not leave an approval behind");
+    }
+
+    #[tokio::test]
+    async fn out_of_range_is_reported_and_changes_nothing_then_works_once_in_range() {
+        let h = harness();
+        let kh = h.keyholder().await;
+        let w = h.wearer(&kh).await;
+        h.approved(&kh, &w).await;
+
+        h.pod.set_in_range(false);
+        let (s, v) = h.call("POST", "/api/wearer/unlock", Some(&w), None).await;
+        assert_eq!(s, StatusCode::CONFLICT);
+        assert_eq!(v["code"], "out_of_range");
+        assert_eq!(h.lock_state(&kh).await, "approved", "a failed attempt must not spend the approval");
+
+        h.pod.set_in_range(true);
+        let (s, _) = h.call("POST", "/api/wearer/unlock", Some(&w), None).await;
+        assert_eq!(s, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn the_keyholder_cannot_unlock_under_a_timer_but_can_lock_any_time() {
+        let h = harness();
+        let kh = h.keyholder().await;
+        h.call("POST", "/api/keyholder/timer", Some(&kh), Some(json!({ "duration_secs": 3600 }))).await;
+
+        let (s, _) = h.call("POST", "/api/keyholder/unlock", Some(&kh), None).await;
+        assert_eq!(s, StatusCode::CONFLICT);
+        assert!(h.pod.ops().is_empty(), "the pod must not be contacted for a refused unlock");
+
+        h.call("POST", "/api/keyholder/timer/clear", Some(&kh), None).await;
+        let (s, v) = h.call("POST", "/api/keyholder/unlock", Some(&kh), None).await;
+        assert_eq!((s, v["lock"].as_str()), (StatusCode::OK, Some("unlocked")));
+        let (s, v) = h.call("POST", "/api/keyholder/lock", Some(&kh), None).await;
+        assert_eq!((s, v["lock"].as_str()), (StatusCode::OK, Some("locked")));
+        let (s, _) = h.call("POST", "/api/keyholder/lock", Some(&kh), None).await;
+        assert_eq!(s, StatusCode::OK, "the pod may be open although we last recorded it locked");
+    }
+
+    #[tokio::test]
+    async fn sync_records_when_the_pod_was_reached_and_the_wearers_sync_has_a_cooldown() {
+        let h = harness();
+        let kh = h.keyholder().await;
+        let w = h.wearer(&kh).await;
+
+        let (_, v) = h.call("GET", "/api/wearer/state", Some(&w), None).await;
+        assert!(v["pod"].is_null());
+
+        let (s, v) = h.call("POST", "/api/wearer/sync", Some(&w), None).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(v["in_range"], true);
+        assert_eq!(v["pod"]["via"], "server");
+        assert!(v["pod"].get("battery").is_none(), "a battery of 0 means unreported and is not shown");
+
+        let (_, v) = h.call("POST", "/api/wearer/sync", Some(&w), None).await;
+        assert_eq!(v["cooldown"], true);
+        assert_eq!(h.pod.ops(), [PodOp::Status], "the cooldown must stop a second Bluetooth session");
+
+        // The keyholder is not throttled, and out of range is an answer rather than an error.
+        h.pod.set_in_range(false);
+        let (s, v) = h.call("POST", "/api/keyholder/sync", Some(&kh), None).await;
+        assert_eq!((s, v["in_range"].as_bool()), (StatusCode::OK, Some(false)));
+    }
+
+    #[tokio::test]
+    async fn losing_control_of_the_pod_is_reported_and_logged() {
+        let h = harness();
+        let kh = h.keyholder().await;
+        let w = h.wearer(&kh).await;
+        h.approved(&kh, &w).await;
+        h.cloud.bound_elsewhere();
+
+        let (s, v) = h.call("POST", "/api/keyholder/sync", Some(&kh), None).await;
+        // The fake pod does not consult the cloud, so exercise the relay path, which does.
+        assert_eq!(s, StatusCode::OK, "{v}");
+        let (s, v) = h.call("POST", "/api/wearer/relay/start", Some(&w), Some(json!({ "intent": "unlock" }))).await;
+        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(v["code"], "control_lost");
+        assert!(h.audit_kinds(&kh).await.contains(&"control_lost".to_string()));
+        assert_eq!(h.lock_state(&kh).await, "approved");
+    }
+
+    // ---------- phone relay ----------
+
+    #[tokio::test]
+    async fn relay_unlock_mints_the_command_only_after_the_handshake_reply_and_records_the_exposure() {
+        let h = harness();
+        let kh = h.keyholder().await;
+        let w = h.wearer(&kh).await;
+        h.approved(&kh, &w).await;
+
+        let (s, v) = h.call("POST", "/api/wearer/relay/start", Some(&w), Some(json!({ "intent": "unlock" }))).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["cmd"], "TOKEN-1");
+        let session = v["session_id"].as_str().unwrap().to_string();
+        assert_eq!(h.cloud.calls(), ["device_token_cmd"], "no unlock bytes yet");
+
+        let (s, v) = h.call("POST", "/api/wearer/relay/reply", Some(&w), Some(json!({ "session_id": session, "hex": "aa11" }))).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!((v["done"].as_bool(), v["cmd"].as_str()), (Some(false), Some("UNLOCK-1")));
+        assert_eq!(h.cloud.calls(), ["device_token_cmd", "decrypt:aa11", "unlock_cmd"], "decrypt must precede the mint");
+        assert_eq!(h.lock_state(&kh).await, "approved", "not unlocked until the pod acknowledges");
+
+        h.cloud.set_reply_type("bb22", "02");
+        let (s, v) = h.call("POST", "/api/wearer/relay/reply", Some(&w), Some(json!({ "session_id": session, "hex": "bb22" }))).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!((v["done"].as_bool(), v["lock"].as_str()), (Some(true), Some("unlocked")));
+        assert_eq!(v["pod"]["via"], "phone");
+
+        let kinds = h.audit_kinds(&kh).await;
+        assert_eq!(kinds.iter().filter(|k| *k == "relay_unlock_issued").count(), 1);
+        assert!(kinds.contains(&"unlocked".to_string()));
+
+        // The session is over: replaying into it gets nothing.
+        let (s, _) = h.call("POST", "/api/wearer/relay/reply", Some(&w), Some(json!({ "session_id": session, "hex": "bb22" }))).await;
+        assert_eq!(s, StatusCode::GONE);
+    }
+
+    #[tokio::test]
+    async fn relay_refuses_to_start_without_approval_and_contacts_the_cloud_for_nothing() {
+        let h = harness();
+        let kh = h.keyholder().await;
+        let w = h.wearer(&kh).await;
+        let (s, _) = h.call("POST", "/api/wearer/relay/start", Some(&w), Some(json!({ "intent": "unlock" }))).await;
+        assert_eq!(s, StatusCode::CONFLICT);
+        h.call("POST", "/api/wearer/request-unlock", Some(&w), None).await;
+        let (s, _) = h.call("POST", "/api/wearer/relay/start", Some(&w), Some(json!({ "intent": "unlock" }))).await;
+        assert_eq!(s, StatusCode::CONFLICT);
+        assert!(h.cloud.calls().is_empty(), "not even a handshake token may be minted");
+    }
+
+    #[tokio::test]
+    async fn relay_never_mints_the_unlock_if_the_approval_lapses_or_a_timer_starts_mid_session() {
+        for interrupt in ["expire", "timer"] {
+            let h = harness();
+            let kh = h.keyholder().await;
+            let w = h.wearer(&kh).await;
+            // A one-minute approval, so it can lapse inside the two-minute relay session.
+            h.call("POST", "/api/wearer/request-unlock", Some(&w), None).await;
+            h.call("POST", "/api/keyholder/approve", Some(&kh), Some(json!({ "ttl_minutes": 1 }))).await;
+            let (_, v) = h.call("POST", "/api/wearer/relay/start", Some(&w), Some(json!({ "intent": "unlock" }))).await;
+            let session = v["session_id"].as_str().unwrap().to_string();
+
+            if interrupt == "expire" {
+                h.advance(90_000);
+            } else {
+                h.call("POST", "/api/keyholder/timer", Some(&kh), Some(json!({ "duration_secs": 3600 }))).await;
+            }
+            let (s, _) = h.call("POST", "/api/wearer/relay/reply", Some(&w), Some(json!({ "session_id": session, "hex": "aa11" }))).await;
+            assert_eq!(s, StatusCode::CONFLICT, "{interrupt}");
+            assert!(!h.cloud.calls().contains(&"unlock_cmd".to_string()), "{interrupt}: unlock bytes must not be minted");
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_treats_a_wrong_acknowledgement_as_failure_and_bad_input_as_bad_input() {
+        let h = harness();
+        let kh = h.keyholder().await;
+        let w = h.wearer(&kh).await;
+        h.approved(&kh, &w).await;
+
+        let (_, v) = h.call("POST", "/api/wearer/relay/start", Some(&w), Some(json!({ "intent": "unlock" }))).await;
+        let session = v["session_id"].as_str().unwrap().to_string();
+        let (s, _) = h.call("POST", "/api/wearer/relay/reply", Some(&w), Some(json!({ "session_id": session, "hex": "not hex" }))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        h.call("POST", "/api/wearer/relay/reply", Some(&w), Some(json!({ "session_id": session, "hex": "aa11" }))).await;
+        // The pod "acknowledges" with a handshake-type reply instead of an unlock.
+        let (s, _) = h.call("POST", "/api/wearer/relay/reply", Some(&w), Some(json!({ "session_id": session, "hex": "cc33" }))).await;
+        assert_eq!(s, StatusCode::BAD_GATEWAY);
+        assert_eq!(h.lock_state(&kh).await, "approved");
+
+        let (s, _) = h.call("POST", "/api/wearer/relay/start", Some(&w), Some(json!({ "intent": "hack" }))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        let (s, _) = h.call("POST", "/api/wearer/relay/reply", Some(&w), Some(json!({ "session_id": "nope", "hex": "aa11" }))).await;
+        assert_eq!(s, StatusCode::GONE);
+    }
+
+    #[tokio::test]
+    async fn relay_status_refreshes_the_pod_info_without_minting_any_command() {
+        let h = harness();
+        let kh = h.keyholder().await;
+        let w = h.wearer(&kh).await;
+        let (_, v) = h.call("POST", "/api/wearer/relay/start", Some(&w), Some(json!({ "intent": "status" }))).await;
+        let session = v["session_id"].as_str().unwrap().to_string();
+        let (s, v) = h.call("POST", "/api/wearer/relay/reply", Some(&w), Some(json!({ "session_id": session, "hex": "aa11" }))).await;
+        assert_eq!((s, v["done"].as_bool()), (StatusCode::OK, Some(true)));
+        assert_eq!(v["pod"]["via"], "phone");
+        assert_eq!(h.cloud.calls(), ["device_token_cmd", "decrypt:aa11"]);
+    }
+
+    #[tokio::test]
+    async fn the_wearers_lock_over_relay_needs_the_lock_to_be_open_and_records_the_phone_path() {
+        let h = harness();
+        let kh = h.keyholder().await;
+        let w = h.wearer(&kh).await;
+        let (s, _) = h.call("POST", "/api/wearer/relay/start", Some(&w), Some(json!({ "intent": "lock" }))).await;
+        assert_eq!(s, StatusCode::CONFLICT, "nothing to lock while it is locked");
+
+        h.call("POST", "/api/keyholder/unlock", Some(&kh), None).await;
+        let (_, v) = h.call("POST", "/api/wearer/relay/start", Some(&w), Some(json!({ "intent": "lock" }))).await;
+        let session = v["session_id"].as_str().unwrap().to_string();
+        let (_, v) = h.call("POST", "/api/wearer/relay/reply", Some(&w), Some(json!({ "session_id": session, "hex": "aa11" }))).await;
+        assert_eq!(v["cmd"], "LOCK-1");
+        h.cloud.set_reply_type("dd44", "03");
+        let (_, v) = h.call("POST", "/api/wearer/relay/reply", Some(&w), Some(json!({ "session_id": session, "hex": "dd44" }))).await;
+        assert_eq!(v["lock"], "locked");
+    }
+
+    // ---------- keyholder's queue ----------
+
+    #[tokio::test]
+    async fn the_keyholder_queues_one_command_and_can_cancel_it_and_the_wearer_sees_it() {
+        let h = harness();
+        let kh = h.keyholder().await;
+        let w = h.wearer(&kh).await;
+
+        let (s, v) = h.call("POST", "/api/keyholder/queue", Some(&kh), Some(json!({ "command": "lock" }))).await;
+        assert_eq!((s, v["queued_command"]["command"].as_str()), (StatusCode::OK, Some("lock")));
+        let (_, v) = h.call("GET", "/api/wearer/state", Some(&w), None).await;
+        assert_eq!(v["queued_command"]["command"], "lock");
+
+        let (s, _) = h.call("POST", "/api/keyholder/queue", Some(&kh), Some(json!({ "command": "unlock" }))).await;
+        assert_eq!(s, StatusCode::CONFLICT);
+        let (s, _) = h.call("POST", "/api/keyholder/queue", Some(&kh), Some(json!({ "command": "explode" }))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+
+        let (s, v) = h.call("POST", "/api/keyholder/queue/cancel", Some(&kh), None).await;
+        assert_eq!((s, v["queued_command"].is_null()), (StatusCode::OK, true));
+        let (s, _) = h.call("POST", "/api/keyholder/queue/cancel", Some(&kh), None).await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_queued_lock_is_carried_out_by_the_wearers_phone_when_they_next_connect() {
+        let h = harness();
+        let kh = h.keyholder().await;
+        let w = h.wearer(&kh).await;
+        h.call("POST", "/api/keyholder/queue", Some(&kh), Some(json!({ "command": "lock" }))).await;
+
+        let (s, v) = h.call("POST", "/api/wearer/relay/start", Some(&w), Some(json!({ "intent": "queued" }))).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        let session = v["session_id"].as_str().unwrap().to_string();
+        let (_, v) = h.call("POST", "/api/wearer/relay/reply", Some(&w), Some(json!({ "session_id": session, "hex": "aa11" }))).await;
+        assert_eq!(v["cmd"], "LOCK-1");
+        h.cloud.set_reply_type("dd44", "03");
+        let (_, v) = h.call("POST", "/api/wearer/relay/reply", Some(&w), Some(json!({ "session_id": session, "hex": "dd44" }))).await;
+        assert_eq!(v["done"], true);
+        assert!(v["queued_command"].is_null());
+
+        let (_, a) = h.call("GET", "/api/keyholder/audit?limit=50", Some(&kh), None).await;
+        let done = a["entries"].as_array().unwrap().iter().find(|e| e["kind"] == "queued_command_done").unwrap();
+        assert_eq!(done["detail"]["via"], "phone");
+        let locked = a["entries"].as_array().unwrap().iter().find(|e| e["kind"] == "locked").unwrap();
+        assert_eq!(locked["actor"], "keyholder", "a queued command is the keyholder's act, not the wearer's");
+    }
+
+    #[tokio::test]
+    async fn a_queued_unlock_is_dropped_if_a_timer_has_started_and_never_reaches_the_pod() {
+        let h = harness();
+        let kh = h.keyholder().await;
+        h.call("POST", "/api/keyholder/queue", Some(&kh), Some(json!({ "command": "unlock" }))).await;
+        h.call("POST", "/api/keyholder/timer", Some(&kh), Some(json!({ "duration_secs": 3600 }))).await;
+
+        assert!(!run_queue_once(&h.state).await);
+        assert!(h.pod.ops().is_empty());
+        assert!(h.audit_kinds(&kh).await.contains(&"queued_command_dropped".to_string()));
+        let (_, v) = h.call("GET", "/api/keyholder/state", Some(&kh), None).await;
+        assert!(v["queued_command"].is_null());
+    }
+
+    #[tokio::test]
+    async fn the_server_runs_a_queued_command_itself_once_the_pod_is_in_range() {
+        let h = harness();
+        let kh = h.keyholder().await;
+        h.call("POST", "/api/keyholder/unlock", Some(&kh), None).await;
+        h.call("POST", "/api/keyholder/queue", Some(&kh), Some(json!({ "command": "lock" }))).await;
+
+        h.pod.set_in_range(false);
+        assert!(!run_queue_once(&h.state).await, "out of range: try again later");
+        let (_, v) = h.call("GET", "/api/keyholder/state", Some(&kh), None).await;
+        assert_eq!(v["queued_command"]["command"], "lock");
+
+        h.pod.set_in_range(true);
+        assert!(run_queue_once(&h.state).await);
+        let (_, v) = h.call("GET", "/api/keyholder/state", Some(&kh), None).await;
+        assert_eq!((v["lock"].as_str(), v["queued_command"].is_null()), (Some("locked"), true));
+        assert_eq!(h.pod.ops(), [PodOp::Unlock, PodOp::Lock]);
+        assert!(!run_queue_once(&h.state).await, "nothing left to run");
     }
 
     #[tokio::test]

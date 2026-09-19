@@ -209,26 +209,28 @@ impl Machine {
     }
 
     /// The pod physically unlocked. Deliberately unconditional: it records a fact.
-    pub fn record_unlocked(&mut self, actor: Actor) -> Vec<Event> {
+    /// `via` says which Bluetooth path did it: "server" or "phone".
+    pub fn record_unlocked(&mut self, actor: Actor, via: &str) -> Vec<Event> {
         self.state = LockState::Unlocked;
         self.approval_expires_ms = None;
-        vec![ev(actor, "unlocked", json!({}))]
+        vec![ev(actor, "unlocked", json!({ "via": via }))]
     }
 
+    /// The wearer can lock what they unlocked. The keyholder can always lock: the pod may
+    /// be physically open even when the last thing we recorded says otherwise.
     pub fn check_lock(&self, actor: Actor) -> Result<()> {
-        if actor == Actor::System {
-            return Err(Error::NotPermitted);
+        match actor {
+            Actor::System => Err(Error::NotPermitted),
+            Actor::Keyholder => Ok(()),
+            Actor::Wearer if self.state == LockState::Unlocked => Ok(()),
+            Actor::Wearer => Err(Error::WrongState(self.state)),
         }
-        if self.state != LockState::Unlocked {
-            return Err(Error::WrongState(self.state));
-        }
-        Ok(())
     }
 
-    pub fn record_locked(&mut self, actor: Actor) -> Vec<Event> {
+    pub fn record_locked(&mut self, actor: Actor, via: &str) -> Vec<Event> {
         self.state = LockState::Locked;
         self.approval_expires_ms = None;
-        vec![ev(actor, "locked", json!({}))]
+        vec![ev(actor, "locked", json!({ "via": via }))]
     }
 
     // ---- timer (keyholder only) ----
@@ -330,10 +332,10 @@ mod tests {
         m.approve(Actor::Keyholder, 10 * S, 15 * M).unwrap();
         assert_eq!(m.state, LockState::Approved);
         m.check_unlock(Actor::Wearer, 20 * S).unwrap();
-        m.record_unlocked(Actor::Wearer);
+        m.record_unlocked(Actor::Wearer, "server");
         assert_eq!(m.state, LockState::Unlocked);
         m.check_lock(Actor::Wearer).unwrap();
-        m.record_locked(Actor::Wearer);
+        m.record_locked(Actor::Wearer, "server");
         assert_eq!(m.state, LockState::Locked);
         // Locking again starts the whole cycle over: no standing approval.
         assert!(m.check_unlock(Actor::Wearer, 30 * S).is_err());
@@ -360,6 +362,16 @@ mod tests {
         assert_eq!(m.check_unlock(Actor::Wearer, 0), Err(Error::WrongState(LockState::Locked)));
         m.request_unlock(Actor::Wearer, 0).unwrap();
         assert_eq!(m.check_unlock(Actor::Wearer, 0), Err(Error::WrongState(LockState::Requested)));
+    }
+
+    #[test]
+    fn the_keyholder_can_lock_in_any_state_but_the_wearer_only_after_unlocking() {
+        let mut m = Machine::default();
+        assert_eq!(m.check_lock(Actor::Wearer), Err(Error::WrongState(LockState::Locked)));
+        m.check_lock(Actor::Keyholder).unwrap();
+        assert_eq!(m.check_lock(Actor::System), Err(Error::NotPermitted));
+        m.record_unlocked(Actor::Keyholder, "server");
+        m.check_lock(Actor::Wearer).unwrap();
     }
 
     #[test]

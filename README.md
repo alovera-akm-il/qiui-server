@@ -1,54 +1,50 @@
-# qiui-server
-A QiUi local server for cages.
+# QIUI Server
 
-Rust port of the Python KeyPod scripts (cloud command generation via the QIUI
-Open Platform API + local BLE via btleplug). See RESEARCH notes for protocol details.
+A local server for QIUI KeyPods with two roles: a **keyholder** (command line and API, password protected) and a
+**wearer** (an installable web app, no password to leak). The server enforces the rules; the wearer's phone only
+asks.
 
-```
-# .qiui_pod_env (gitignored) must contain QIUI_CLIENT_ID=...
-cargo run -- identify
-cargo run -- status --debug
-cargo run -- unlock
-cargo run -- lock
-```
-Needs BlueZ + libdbus dev headers on Linux.
+![The wearer's screens for one unlock cycle (design mockups)](docs/images/wearer-flow.gif)
 
-## Running the server
+*The wearer's app, as designed. The screens are mockups; the app itself is the next piece of work. Everything it
+will do already works through the API.*
 
-```
-qiui-server init                      # keyholder password + recovery PIN (prompted, hidden)
-qiui-server serve                     # http://127.0.0.1:8443, loopback only
-tailscale serve --bg https / http://127.0.0.1:8443   # TLS for phones; the PWA needs HTTPS
-qiui-server pairing-code              # one-time code for the wearer's device
-qiui-server devices / revoke-device <id>
-qiui-server reset-password            # needs the recovery PIN; local shell only
-```
+## What it does
 
-State lives in `~/.local/share/qiui-server` (or `--data-dir` / `$QIUI_DATA_DIR`): `qiui.db` and `pepper.key`,
-both mode 0600. The pepper is what makes a copied database useless for guessing passwords; back it up with the
-database or every stored hash becomes unverifiable.
+- **Unlock needs approval.** The wearer can only ask. The keyholder approves, and the approval is single-use and expires.
+- **Timers the keyholder controls**: exact or random, pausable, clearable. While a timer runs or is paused nobody unlocks.
+  A finished timer only reopens requests.
+- **Works away from the server.** Over the server's Bluetooth when the pod is near, or relayed by the wearer's phone
+  when it is not. The keyholder can queue a lock or unlock for the next time the pod can be reached.
+- **Short Bluetooth sessions.** Connect, run one command, disconnect.
+- **Everything is logged** in a tamper-evident audit log. Passwords are never stored; the database holds only keyed hashes.
 
-`lock` and `unlock` ask for the keyholder password and refuse to unlock while a timer is running or paused.
+![A keyholder session in the terminal](docs/images/cli-keyholder.gif)
 
-### Scripting
-
-Anything that prompts can be given its secret up front. Prefer environment variables: a `--password` flag is
-visible in `ps` and saved in shell history (the tool warns if you use one).
-
-| Command | Environment variables | Flags |
-|---|---|---|
-| `init` | `QIUI_KEYHOLDER_PASSWORD`, `QIUI_RECOVERY_PIN` | `--password`, `--pin` |
-| `reset-password` | `QIUI_RECOVERY_PIN`, `QIUI_NEW_PASSWORD` | `--pin`, `--new-password` |
-| `lock`, `unlock` | `QIUI_KEYHOLDER_PASSWORD` | `--password` |
+## Quick start
 
 ```
-QIUI_KEYHOLDER_PASSWORD=... qiui-server unlock
+cargo build --release
+qiui-server init                          # keyholder password + recovery PIN
+qiui-server config set-client-id          # your QIUI client id
+qiui-server config set-mac E5:26:D6:6E:B6:8A
+qiui-server serve                         # http://127.0.0.1:8443; put HTTPS in front for phones
+qiui-server pairing-code                  # one-time code for the wearer's phone
+qiui-server status                        # then: approve, timer set 14d, queue lock, audit …
 ```
 
-## API
+The pod must first be **unbound from the QiUi phone app**. Passwords can come from `QIUI_*` environment variables, so
+every command is scriptable.
 
-`POST /api/keyholder/login` returns a bearer token (8 h). `POST /api/wearer/pair` trades a pairing code for a
-device token. Keyholder routes live under `/api/keyholder/*` (state, approve, deny, timer, timer/roll,
-timer/pause, timer/resume, timer/clear, messages, audit, pairing-code, devices, password, logout); wearer routes
-under `/api/wearer/*` (state, request-unlock, cancel-request, messages). A wearer token is refused on every
-keyholder route.
+## Documentation
+
+- **[Usage guide](docs/usage.md)**: setup, the keyholder's commands, the wearer's screens, security model and limits,
+  troubleshooting, and the full API reference.
+- **[RESEARCH.md](RESEARCH.md)**: how QIUI's API and the pod actually behave, including live test results.
+
+## Status
+
+Built and tested: accounts and pairing, lock state machine, timers, approvals, queue, audit log, keyholder CLI, HTTP
+API, Bluetooth control (server and phone relay). Bluetooth against the real pod has been exercised with the earlier
+Python scripts and a browser probe; the Rust Bluetooth path is covered by tests with a fake pod and still needs its
+first run against hardware. Still to build: the wearer's web app and push notifications.

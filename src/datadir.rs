@@ -7,6 +7,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 
 use crate::accounts::{self, Auth};
 use crate::store::Store;
@@ -54,6 +55,35 @@ fn load_pepper(dir: &Path) -> Result<Vec<u8>> {
     }
 }
 
+/// QIUI credentials and the pod's address. Stored owner-only in the data directory, next to the
+/// database. This is a plain 0600 file, not encryption: anyone who can read your files can read it.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct Config {
+    pub client_id: Option<String>,
+    pub api_key: Option<String>,
+    pub mac: Option<String>,
+}
+
+pub fn load_config(root: &Path) -> Result<Config> {
+    let path = root.join("config.json");
+    if !path.exists() {
+        return Ok(Config::default());
+    }
+    require_private(&path)?;
+    serde_json::from_slice(&fs::read(&path)?).with_context(|| format!("reading {}", path.display()))
+}
+
+pub fn save_config(root: &Path, cfg: &Config) -> Result<()> {
+    private_dir(root)?;
+    let tmp = root.join("config.json.tmp");
+    let _ = fs::remove_file(&tmp);
+    let mut f = OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
+    f.write_all(&serde_json::to_vec_pretty(cfg)?)?;
+    f.sync_all()?;
+    fs::rename(&tmp, root.join("config.json"))?;
+    Ok(())
+}
+
 pub fn open(root: &Path) -> Result<(Store, Auth)> {
     private_dir(root)?;
     let pepper = load_pepper(root)?;
@@ -90,6 +120,22 @@ mod tests {
         // A pepper readable by others is refused.
         fs::set_permissions(dir.join("pepper.key"), fs::Permissions::from_mode(0o644)).unwrap();
         assert!(open(&dir).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_round_trips_privately_and_a_loose_file_is_refused() {
+        let dir = std::env::temp_dir().join(format!("qiui-config-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        assert!(load_config(&dir).unwrap().client_id.is_none());
+
+        save_config(&dir, &Config { client_id: Some("Client_x".into()), api_key: None, mac: Some("AA:BB".into()) }).unwrap();
+        assert_eq!(fs::metadata(dir.join("config.json")).unwrap().permissions().mode() & 0o777, 0o600);
+        let back = load_config(&dir).unwrap();
+        assert_eq!((back.client_id.as_deref(), back.mac.as_deref()), (Some("Client_x"), Some("AA:BB")));
+
+        fs::set_permissions(dir.join("config.json"), fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(load_config(&dir).is_err());
         let _ = fs::remove_dir_all(&dir);
     }
 }

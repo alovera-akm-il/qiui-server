@@ -25,6 +25,31 @@ pub fn load_env(path: impl AsRef<Path>) -> Result<HashMap<String, String>> {
         .collect())
 }
 
+/// Keep the platform token out of debug output that people paste into chats.
+fn mask_token(body: &str) -> String {
+    const KEY: &str = "\"platformApiToken\":\"";
+    match body.find(KEY) {
+        Some(i) => {
+            let start = i + KEY.len();
+            let end = body[start..].find('"').map_or(body.len(), |n| start + n);
+            format!("{}<masked>{}", &body[..start], &body[end..])
+        }
+        None => body.to_string(),
+    }
+}
+
+/// QIUI answered HTTP 200 but with a non-200 `code` in the body.
+#[derive(Debug, thiserror::Error)]
+#[error("QIUI code {code}: {message}")]
+pub struct ApiCodeError {
+    pub code: i64,
+    pub message: String,
+}
+
+/// The device is bound in the consumer app (500059) or on another platform (500025):
+/// something outside this server has taken control of the pod.
+pub const BOUND_ELSEWHERE_CODES: [i64; 2] = [500025, 500059];
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeviceInfo {
@@ -46,6 +71,7 @@ pub struct QiuiClient {
     client_id: String,
     base_url: String,
     token: Option<String>,
+    expires_at_ms: Option<i64>,
     debug: bool,
 }
 
@@ -56,6 +82,7 @@ impl QiuiClient {
             client_id: client_id.into(),
             base_url: BASE_URL.to_string(),
             token: None,
+            expires_at_ms: None,
             debug,
         }
     }
@@ -74,7 +101,7 @@ impl QiuiClient {
         let status = resp.status();
         let text = resp.text().await?;
         if self.debug {
-            eprintln!("  POST {path} -> HTTP {status}: {text}");
+            eprintln!("  POST {path} -> HTTP {status}: {}", mask_token(&text));
         }
         if !status.is_success() {
             bail!("POST {path} failed: HTTP {status}: {text}");
@@ -83,7 +110,8 @@ impl QiuiClient {
         if let Some(code) = value.get("code").and_then(Value::as_i64)
             && code != 200
         {
-            bail!("POST {path} rejected: code {code}: {}", value["message"]);
+            let message = value["message"].as_str().unwrap_or_default().to_string();
+            return Err(anyhow::Error::new(ApiCodeError { code, message }).context(format!("POST {path}")));
         }
         Ok(value)
     }
@@ -98,20 +126,29 @@ impl QiuiClient {
         json!({ "clientId": self.client_id, "grantType": "client_credentials" })
     }
 
-    pub async fn get_platform_token(&mut self) -> Result<()> {
-        let v = self
-            .post("/system/api/device/common/getPlatformApiToken", self.grant_body(), false)
-            .await?;
-        self.token = Some(v["data"]["platformApiToken"].as_str().context("no platformApiToken")?.into());
+    fn store_token(&mut self, v: &Value) -> Result<()> {
+        let data = &v["data"];
+        self.token = Some(data["platformApiToken"].as_str().context("no platformApiToken")?.into());
+        // `expiresTime` is seconds remaining. QIUI hands back the same token until it expires,
+        // so this count goes down between calls rather than resetting.
+        let secs = data["expiresTime"].as_i64().unwrap_or(0);
+        self.expires_at_ms = Some(crate::api::system_now_ms() + secs * 1000);
         Ok(())
     }
 
+    /// When the current platform token stops working, if we have one.
+    pub fn token_expires_at_ms(&self) -> Option<i64> {
+        self.token.as_ref().and(self.expires_at_ms)
+    }
+
+    pub async fn get_platform_token(&mut self) -> Result<()> {
+        let v = self.post("/system/api/device/common/getPlatformApiToken", self.grant_body(), false).await?;
+        self.store_token(&v)
+    }
+
     pub async fn refresh_platform_token(&mut self) -> Result<()> {
-        let v = self
-            .post("/system/api/device/common/refreshPlatformApiToken", self.grant_body(), true)
-            .await?;
-        self.token = Some(v["data"]["platformApiToken"].as_str().context("no platformApiToken")?.into());
-        Ok(())
+        let v = self.post("/system/api/device/common/refreshPlatformApiToken", self.grant_body(), true).await?;
+        self.store_token(&v)
     }
 
     pub async fn query_device_info(&self, mac: &str) -> Result<Option<DeviceInfo>> {

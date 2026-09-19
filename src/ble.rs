@@ -19,6 +19,8 @@ pub const KNOWN_MAC: &str = "E5:26:D6:6E:B6:8A";
 pub const MAC_PREFIX: &str = "E5:26:D6";
 
 const SCAN_TIME: Duration = Duration::from_secs(8);
+/// How long a session waits for the pod to show up before calling it out of range.
+const FIND_TIMEOUT: Duration = Duration::from_secs(8);
 const NOTIFY_TIMEOUT: Duration = Duration::from_secs(10);
 
 async fn adapter() -> Result<Adapter> {
@@ -40,13 +42,25 @@ pub async fn scan() -> Result<Vec<(String, Peripheral)>> {
         .collect())
 }
 
-pub async fn find(mac: &str) -> Result<Peripheral> {
-    scan()
-        .await?
-        .into_iter()
-        .find(|(addr, _)| addr.eq_ignore_ascii_case(mac))
-        .map(|(_, p)| p)
-        .with_context(|| format!("{mac} not seen while scanning (is it in pairing mode?)"))
+/// The pod did not appear while scanning.
+#[derive(Debug, thiserror::Error)]
+#[error("{0} was not seen while scanning (is it awake and in range?)")]
+pub struct NotFound(pub String);
+
+/// Scan until the pod shows up, then stop at once, or give up after `within`.
+pub async fn find(mac: &str, within: Duration) -> Result<Peripheral> {
+    let adapter = adapter().await?;
+    adapter.start_scan(ScanFilter::default()).await?;
+    let deadline = tokio::time::Instant::now() + within;
+    let found = loop {
+        let hit = adapter.peripherals().await?.into_iter().find(|p| p.address().to_string().eq_ignore_ascii_case(mac));
+        if hit.is_some() || tokio::time::Instant::now() >= deadline {
+            break hit;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
+    adapter.stop_scan().await.ok();
+    found.ok_or_else(|| anyhow::Error::new(NotFound(mac.to_string())))
 }
 
 pub struct KeyPod {
@@ -58,7 +72,7 @@ pub struct KeyPod {
 
 impl KeyPod {
     pub async fn connect(mac: &str, debug: bool) -> Result<Self> {
-        let peripheral = find(mac).await?;
+        let peripheral = find(mac, FIND_TIMEOUT).await?;
         peripheral.connect().await?;
         peripheral.discover_services().await?;
         let chars = peripheral.characteristics();
@@ -107,6 +121,16 @@ impl KeyPod {
             self.peripheral.disconnect().await?;
         }
         Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::pod::Transport for KeyPod {
+    async fn exchange(&mut self, cmd_hex: &str) -> Result<String, crate::pod::PodError> {
+        use crate::pod::PodError;
+        self.write_hex(cmd_hex).await.map_err(|e| {
+            if e.to_string().contains("timed out") { PodError::Timeout } else { PodError::Ble(format!("{e:#}")) }
+        })
     }
 }
 

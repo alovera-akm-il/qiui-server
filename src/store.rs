@@ -42,9 +42,16 @@ impl Store {
                 approval_expires_ms INTEGER,
                 timer_kind TEXT NOT NULL,
                 timer_ms INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS pod_status (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                checked_ms INTEGER NOT NULL,
+                via TEXT NOT NULL,
+                battery INTEGER
             );",
         )?;
         audit::migrate(&conn)?;
+        crate::queue::migrate(&conn)?;
         crate::accounts::migrate(&conn)?;
         Ok(Self { conn })
     }
@@ -55,6 +62,24 @@ impl Store {
 
     pub fn machine(&self) -> rusqlite::Result<Machine> {
         load(&self.conn)
+    }
+
+    /// Remember when the pod was last reached, and how. Battery is stored only if the pod reported one.
+    pub fn save_pod_status(&self, now_ms: i64, via: &str, battery: Option<i64>) -> rusqlite::Result<()> {
+        let battery = battery.filter(|b| *b > 0);
+        self.conn.execute(
+            "INSERT INTO pod_status (id, checked_ms, via, battery) VALUES (1, ?1, ?2, ?3)
+             ON CONFLICT(id) DO UPDATE SET checked_ms = ?1, via = ?2, battery = ?3",
+            params![now_ms, via, battery],
+        )?;
+        Ok(())
+    }
+
+    /// (checked_ms, via, battery)
+    pub fn pod_status(&self) -> rusqlite::Result<Option<(i64, String, Option<i64>)>> {
+        self.conn
+            .query_row("SELECT checked_ms, via, battery FROM pod_status WHERE id = 1", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .optional()
     }
 
     /// Record an event that is not a lock-state change (logins, pairing, password resets...).
