@@ -13,11 +13,12 @@ use qiui_server::accounts::{self, AuthError};
 use qiui_server::api::{self, AppState, system_now_ms};
 use qiui_server::ble::{self, KNOWN_MAC, MAC_PREFIX};
 use qiui_server::client::{ENV_FILE, load_env};
-use qiui_server::cloud::{Cloud, QiuiCloud, SimulatedCloud, UnconfiguredCloud};
+use qiui_server::cloud::{Cloud, LazyCloud, QiuiCloud, SimulatedCloud, UnconfiguredCloud};
 use qiui_server::datadir::{self, Config};
 use qiui_server::hardware::Hardware;
 use qiui_server::machine::Actor;
 use qiui_server::pod::{BlePod, PodError, PodLink, PodOp, SimulatedPod};
+use qiui_server::secrets::SealedSecrets;
 use qiui_server::push::{self, DEFAULT_CONTACT, HttpPushSender, Vapid};
 use qiui_server::store::{ApplyError, Store};
 
@@ -44,7 +45,8 @@ struct Cli {
 #[derive(Args, Clone)]
 struct PasswordArg {
     /// Keyholder password. Visible in `ps` and shell history; prefer QIUI_KEYHOLDER_PASSWORD.
-    #[arg(long, env = "QIUI_KEYHOLDER_PASSWORD", hide_env_values = true)]
+    /// Accepted anywhere on the line, so `timer set 1h --password …` works as well as `timer --password … set 1h`.
+    #[arg(long, env = "QIUI_KEYHOLDER_PASSWORD", hide_env_values = true, global = true)]
     password: Option<String>,
 }
 
@@ -130,12 +132,16 @@ enum Action {
         #[arg(long, env = "QIUI_NEW_PASSWORD", hide_env_values = true)]
         new_password: Option<String>,
     },
-    /// Print a one-time code to pair the wearer's device
-    PairingCode,
-    /// List paired wearer devices
-    Devices,
-    /// Sign a wearer device out and forbid it from reconnecting
-    RevokeDevice { id: i64 },
+    /// Print a one-time code to pair the wearer's device (needs the keyholder password)
+    PairingCode(PasswordArg),
+    /// List paired wearer devices (needs the keyholder password)
+    Devices(PasswordArg),
+    /// Sign a wearer device out and forbid it from reconnecting (needs the keyholder password)
+    RevokeDevice {
+        id: i64,
+        #[command(flatten)]
+        auth: PasswordArg,
+    },
     /// QIUI credentials and the pod's address
     Config {
         #[command(subcommand)]
@@ -169,24 +175,42 @@ enum QueueCmd {
 
 #[derive(Subcommand)]
 enum ConfigCmd {
-    /// Show what is configured (secrets masked)
-    Show,
-    /// Set the QIUI client id
+    /// Show what is configured (nothing secret is displayed)
+    Show(PasswordArg),
+    /// Set the QIUI client id. It is stored encrypted, under your keyholder password.
     SetClientId {
         #[arg(env = "QIUI_CLIENT_ID", hide_env_values = true)]
         value: Option<String>,
+        #[command(flatten)]
+        auth: PasswordArg,
     },
-    /// Set the QIUI API key
+    /// Set the QIUI API key. It is stored encrypted, under your keyholder password.
     SetApiKey {
         #[arg(env = "QIUI_API_KEY", hide_env_values = true)]
         value: Option<String>,
+        #[command(flatten)]
+        auth: PasswordArg,
     },
     /// Set the pod's Bluetooth address
-    SetMac { mac: String },
+    SetMac {
+        mac: String,
+        #[command(flatten)]
+        auth: PasswordArg,
+    },
     /// Set the contact address push services can use (mailto:you@example.com)
-    SetPushContact { contact: String },
-    /// Import QIUI_CLIENT_ID / QIUI_PROD_API_KEY from an old .qiui_pod_env file
-    ImportEnv { path: Option<PathBuf> },
+    SetPushContact {
+        contact: String,
+        #[command(flatten)]
+        auth: PasswordArg,
+    },
+    /// Import QIUI_CLIENT_ID / QIUI_PROD_API_KEY from an old .qiui_pod_env file (stored encrypted)
+    ImportEnv {
+        path: Option<PathBuf>,
+        #[command(flatten)]
+        auth: PasswordArg,
+    },
+    /// Encrypt credentials that an older version left in config.json as plain text
+    Encrypt(PasswordArg),
 }
 
 #[tokio::main]
@@ -215,9 +239,9 @@ async fn main() -> Result<()> {
         }
         Action::Init { password, pin } => init(&cli, password.clone(), pin.clone()),
         Action::ResetPassword { pin, new_password } => reset_password(&cli, pin.clone(), new_password.clone()),
-        Action::PairingCode => pairing_code(&cli),
-        Action::Devices => devices(&cli),
-        Action::RevokeDevice { id } => revoke_device(&cli, *id),
+        Action::PairingCode(a) => pairing_code(&cli, a),
+        Action::Devices(a) => devices(&cli, a),
+        Action::RevokeDevice { id, auth } => revoke_device(&cli, auth, *id),
         Action::Config { cmd } => config(&cli, cmd),
         Action::Identify => identify().await,
     }
@@ -229,8 +253,14 @@ async fn main() -> Result<()> {
 fn secret(given: Option<String>, prompt: &str) -> Result<String> {
     match given {
         Some(s) => Ok(s),
-        None => Ok(rpassword::prompt_password(prompt)?),
+        None => ask_hidden(prompt),
     }
+}
+
+/// A hidden prompt. When there is no terminal (a script, a service) say what to do instead.
+fn ask_hidden(prompt: &str) -> Result<String> {
+    rpassword::prompt_password(prompt)
+        .map_err(|e| anyhow!("cannot ask for that here ({e}). Run this in a terminal, or supply it with the QIUI_* environment variable or its flag."))
 }
 
 fn new_secret(given: Option<String>, what: &str) -> Result<String> {
@@ -249,8 +279,8 @@ fn warn_if_secret_on_command_line() {
 }
 
 fn prompt_twice(what: &str) -> Result<String> {
-    let first = rpassword::prompt_password(format!("New {what}: "))?;
-    let second = rpassword::prompt_password(format!("Repeat {what}: "))?;
+    let first = ask_hidden(&format!("New {what}: "))?;
+    let second = ask_hidden(&format!("Repeat {what}: "))?;
     if first != second {
         bail!("the two entries did not match");
     }
@@ -463,20 +493,65 @@ fn resolve_config(cli: &Cli) -> Result<(PathBuf, Config)> {
     Ok((root, cfg))
 }
 
-/// Client id from the config file, else QIUI_CLIENT_ID, else an old `.qiui_pod_env`.
-fn credentials(cli: &Cli, cfg: &Config) -> Option<(String, String)> {
-    let client_id = cfg
-        .client_id
+/// Where the QIUI client id comes from.
+enum CredentialSource {
+    /// Encrypted in config.json: needs the keyholder's password to open.
+    Sealed(SealedSecrets),
+    /// Plain text: an old config.json, QIUI_CLIENT_ID, or an old `.qiui_pod_env`.
+    Plain(String),
+    None,
+}
+
+fn credential_source(cfg: &Config) -> CredentialSource {
+    if let Some(sealed) = &cfg.secrets {
+        return CredentialSource::Sealed(sealed.clone());
+    }
+    cfg.client_id
         .clone()
         .or_else(|| std::env::var("QIUI_CLIENT_ID").ok())
-        .or_else(|| load_env(ENV_FILE).ok().and_then(|e| e.get("QIUI_CLIENT_ID").cloned()))?;
-    let mac = cli.mac.clone().or_else(|| cfg.mac.clone()).unwrap_or_else(|| KNOWN_MAC.to_string());
-    Some((client_id, mac))
+        .or_else(|| load_env(ENV_FILE).ok().and_then(|e| e.get("QIUI_CLIENT_ID").cloned()))
+        .map_or(CredentialSource::None, CredentialSource::Plain)
+}
+
+fn pod_mac(cli: &Cli, cfg: &Config) -> String {
+    cli.mac.clone().or_else(|| cfg.mac.clone()).unwrap_or_else(|| KNOWN_MAC.to_string())
+}
+
+/// Ask for (or take) the keyholder password and check it, counting failures toward the lockout.
+fn verify_keyholder(store: &Store, auth: &accounts::Auth, given: Option<String>) -> Result<String> {
+    let now = system_now_ms();
+    let password = secret(given, "Keyholder password: ")?;
+    match accounts::verify_password(store.connection(), auth, &password) {
+        Ok(()) => Ok(password),
+        Err(AuthError::Invalid) => {
+            store.log_failure(now, "local-cli", "login_failed")?;
+            bail!("wrong password")
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 async fn direct(cli: &Cli, auth: &PasswordArg, what: &str) -> Result<()> {
     let (_, cfg) = resolve_config(cli)?;
-    let (client_id, mac) = credentials(cli, &cfg).ok_or_else(|| anyhow!("no QIUI client id configured. Run `qiui-server config set-client-id`."))?;
+    let (mut store, auth_obj) = open_store(cli)?;
+    let mac = pod_mac(cli, &cfg);
+
+    // Lock and unlock always need the password. `sync` needs it only to open encrypted credentials.
+    let source = credential_source(&cfg);
+    let password = if what != "sync" || matches!(source, CredentialSource::Sealed(_)) {
+        Some(verify_keyholder(&store, &auth_obj, auth.password.clone())?)
+    } else {
+        None
+    };
+    let client_id = match source {
+        CredentialSource::Sealed(sealed) => {
+            let opened = qiui_server::secrets::open(&auth_obj, password.as_deref().unwrap_or_default(), &sealed)
+                .map_err(|e| anyhow!("{e}. If you reset the password with the recovery PIN, run `qiui-server config set-client-id` again."))?;
+            opened.client_id.clone().ok_or_else(|| anyhow!("no QIUI client id stored. Run `qiui-server config set-client-id`."))?
+        }
+        CredentialSource::Plain(id) => id,
+        CredentialSource::None => bail!("no QIUI client id configured. Run `qiui-server config set-client-id`."),
+    };
     let cloud = QiuiCloud::new(&client_id, &mac, cli.debug);
     let pod = BlePod { mac, debug: cli.debug };
 
@@ -486,17 +561,7 @@ async fn direct(cli: &Cli, auth: &PasswordArg, what: &str) -> Result<()> {
         return Ok(());
     }
 
-    let (mut store, args_auth) = open_store(cli)?;
     let now = system_now_ms();
-    let password = secret(auth.password.clone(), "Keyholder password: ")?;
-    match accounts::verify_password_throttled(store.connection(), &args_auth, &password, now) {
-        Ok(()) => {}
-        Err(AuthError::Invalid) => {
-            store.log(now, "local-cli", "login_failed", &json!({}))?;
-            bail!("wrong password");
-        }
-        Err(e) => return Err(e.into()),
-    }
     let op = if what == "unlock" { PodOp::Unlock } else { PodOp::Lock };
     // Also applies time (a finished timer, a lapsed approval) before checking the rules.
     store
@@ -561,18 +626,33 @@ fn reset_password(cli: &Cli, pin: Option<String>, new_password: Option<String>) 
         Ok(()) => {
             store.log(now, "local-cli", "password_reset", &json!({}))?;
             println!("Password reset. Every keyholder session was signed out.");
+            // The QIUI credentials are encrypted under the old password, and a recovery PIN is far too weak
+            // to protect them, so they cannot be carried over.
+            if datadir::clear_sealed(&datadir::resolve(cli.data_dir.clone())?)? {
+                store.log(now, "local-cli", "credentials_cleared", &json!({}))?;
+                println!("The encrypted QIUI credentials could not be carried over to the new password and were removed.");
+                println!("Enter them again: qiui-server config set-client-id");
+            }
             Ok(())
         }
         Err(AuthError::Invalid) => {
-            store.log(now, "local-cli", "password_reset_failed", &json!({}))?;
+            store.log_failure(now, "local-cli", "password_reset_failed")?;
             bail!("that recovery PIN is not correct")
         }
         Err(e) => Err(e.into()),
     }
 }
 
-fn pairing_code(cli: &Cli) -> Result<()> {
-    let (store, _) = open_store(cli)?;
+/// Everything that touches the account or its settings needs the keyholder password. The exceptions
+/// are `init` (no account exists yet), `reset-password` (the recovery route), `serve` and `identify`.
+fn require_keyholder(cli: &Cli, auth: &PasswordArg) -> Result<(Store, accounts::Auth)> {
+    let (store, auth_obj) = open_store(cli)?;
+    verify_keyholder(&store, &auth_obj, auth.password.clone())?;
+    Ok((store, auth_obj))
+}
+
+fn pairing_code(cli: &Cli, auth: &PasswordArg) -> Result<()> {
+    let (store, _) = require_keyholder(cli, auth)?;
     let now = system_now_ms();
     let code = accounts::create_pairing_code(store.connection(), now)?;
     store.log(now, "local-cli", "pairing_code_created", &json!({}))?;
@@ -581,8 +661,8 @@ fn pairing_code(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-fn devices(cli: &Cli) -> Result<()> {
-    let (store, _) = open_store(cli)?;
+fn devices(cli: &Cli, auth: &PasswordArg) -> Result<()> {
+    let (store, _) = require_keyholder(cli, auth)?;
     let list = accounts::list_devices(store.connection())?;
     if list.is_empty() {
         println!("No devices paired.");
@@ -595,8 +675,8 @@ fn devices(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-fn revoke_device(cli: &Cli, id: i64) -> Result<()> {
-    let (store, _) = open_store(cli)?;
+fn revoke_device(cli: &Cli, auth: &PasswordArg, id: i64) -> Result<()> {
+    let (store, _) = require_keyholder(cli, auth)?;
     let now = system_now_ms();
     if !accounts::revoke_device(store.connection(), id, now)? {
         bail!("no active device with id {id}");
@@ -608,33 +688,81 @@ fn revoke_device(cli: &Cli, id: i64) -> Result<()> {
 
 // ---------- configuration ----------
 
-fn mask(s: &str) -> String {
-    if s.len() <= 6 { "*".repeat(s.len()) } else { format!("{}…{} ({} chars)", &s[..4], &s[s.len() - 2..], s.len()) }
-}
-
 fn config(cli: &Cli, cmd: &ConfigCmd) -> Result<()> {
     let (root, mut cfg) = resolve_config(cli)?;
     match cmd {
-        ConfigCmd::Show => {
-            println!("Data directory  {}", root.display());
-            println!("Client id       {}", cfg.client_id.as_deref().map(mask).unwrap_or_else(|| "not set".into()));
-            println!("API key         {}", cfg.api_key.as_deref().map(mask).unwrap_or_else(|| "not set".into()));
-            println!("Pod address     {}", cfg.mac.as_deref().unwrap_or("not set (using the built-in default)"));
-            println!("Push contact    {}", cfg.push_contact.as_deref().unwrap_or("not set (using a placeholder)"));
-            return Ok(());
+        ConfigCmd::Show(auth) => {
+            require_keyholder(cli, auth)?;
+            println!("Data directory    {}", root.display());
+            let credentials = if cfg.secrets.is_some() {
+                "encrypted (opened in memory when the keyholder signs in)"
+            } else if cfg.has_plain_secrets() {
+                "STORED IN PLAIN TEXT. Run `qiui-server config encrypt`."
+            } else {
+                "not set"
+            };
+            println!("QIUI credentials  {credentials}");
+            println!("Pod address       {}", cfg.mac.as_deref().unwrap_or("not set (using the built-in default)"));
+            println!("Push contact      {}", cfg.push_contact.as_deref().unwrap_or("not set (using a placeholder)"));
+            Ok(())
         }
-        ConfigCmd::SetClientId { value } => cfg.client_id = Some(secret(value.clone(), "QIUI client id: ")?.trim().to_string()),
-        ConfigCmd::SetApiKey { value } => cfg.api_key = Some(secret(value.clone(), "QIUI API key: ")?.trim().to_string()),
-        ConfigCmd::SetMac { mac } => cfg.mac = Some(mac.trim().to_ascii_uppercase()),
-        ConfigCmd::SetPushContact { contact } => cfg.push_contact = Some(contact.trim().to_string()),
-        ConfigCmd::ImportEnv { path } => {
+        ConfigCmd::SetMac { mac, auth } => {
+            require_keyholder(cli, auth)?;
+            cfg.mac = Some(mac.trim().to_ascii_uppercase());
+            save_plain(&root, &cfg)
+        }
+        ConfigCmd::SetPushContact { contact, auth } => {
+            require_keyholder(cli, auth)?;
+            cfg.push_contact = Some(contact.trim().to_string());
+            save_plain(&root, &cfg)
+        }
+        ConfigCmd::SetClientId { value, auth } => {
+            let id = secret(value.clone(), "QIUI client id: ")?.trim().to_string();
+            seal_credentials(cli, &root, &mut cfg, auth, |s| s.client_id = Some(id))
+        }
+        ConfigCmd::SetApiKey { value, auth } => {
+            let key = secret(value.clone(), "QIUI API key: ")?.trim().to_string();
+            seal_credentials(cli, &root, &mut cfg, auth, |s| s.api_key = Some(key))
+        }
+        ConfigCmd::ImportEnv { path, auth } => {
             let env = load_env(path.clone().unwrap_or_else(|| PathBuf::from(ENV_FILE)))?;
-            cfg.client_id = env.get("QIUI_CLIENT_ID").cloned().or(cfg.client_id);
-            cfg.api_key = env.get("QIUI_PROD_API_KEY").cloned().or(cfg.api_key);
+            let (id, key) = (env.get("QIUI_CLIENT_ID").cloned(), env.get("QIUI_PROD_API_KEY").cloned());
+            seal_credentials(cli, &root, &mut cfg, auth, |s| {
+                s.client_id = id.or(s.client_id.take());
+                s.api_key = key.or(s.api_key.take());
+            })
+        }
+        ConfigCmd::Encrypt(auth) => {
+            if !cfg.has_plain_secrets() {
+                require_keyholder(cli, auth)?;
+                println!("Nothing to encrypt: no credentials are stored in plain text.");
+                return Ok(());
+            }
+            seal_credentials(cli, &root, &mut cfg, auth, |_| {})
         }
     }
-    datadir::save_config(&root, &cfg)?;
+}
+
+fn save_plain(root: &std::path::Path, cfg: &Config) -> Result<()> {
+    datadir::save_config(root, cfg)?;
     println!("Saved. Restart a running server for the change to take effect.");
+    Ok(())
+}
+
+/// Change the stored QIUI credentials. They are always written encrypted, under the keyholder's
+/// password, and any plain-text copy left by an older version is removed in the same write.
+fn seal_credentials(cli: &Cli, root: &std::path::Path, cfg: &mut Config, auth: &PasswordArg, edit: impl FnOnce(&mut qiui_server::secrets::Secrets)) -> Result<()> {
+    let (store, auth_obj) = open_store(cli)?;
+    if !accounts::is_initialised(store.connection())? {
+        bail!("create the keyholder account first (`qiui-server init`): the credentials are encrypted under its password.");
+    }
+    let password = verify_keyholder(&store, &auth_obj, auth.password.clone())?;
+    let mut secrets = cfg.secrets(&auth_obj, &password).map_err(|e| anyhow!("{e}"))?;
+    edit(&mut secrets);
+    cfg.seal_secrets(&auth_obj, &password, &secrets).map_err(|e| anyhow!("{e}"))?;
+    datadir::save_config(root, cfg)?;
+    store.log(system_now_ms(), "local-cli", "credentials_sealed", &json!({}))?;
+    println!("Saved, encrypted under your keyholder password. Restart a running server for the change to take effect.");
     Ok(())
 }
 
@@ -649,26 +777,38 @@ async fn serve(cli: &Cli, bind: SocketAddr, allow_remote: bool, simulate: bool, 
         eprintln!("Note: no keyholder account yet. Run `qiui-server init` first.");
     }
     let (root, cfg) = resolve_config(cli)?;
-    let (cloud, pod, real_cloud, mac): (Arc<dyn Cloud>, Arc<dyn PodLink>, Option<Arc<QiuiCloud>>, String) = if simulate {
+    let (cloud, pod, vault, mac): (Arc<dyn Cloud>, Arc<dyn PodLink>, Option<Arc<LazyCloud>>, String) = if simulate {
         eprintln!("\n*** DEMO MODE: the pod is simulated. Nothing here touches a real pod or QIUI. ***\n");
         (Arc::new(SimulatedCloud), Arc::new(SimulatedPod { in_range: sim_in_range }), None, "simulated".to_string())
     } else {
-        match credentials(cli, &cfg) {
-            Some((client_id, mac)) => {
-                let c = Arc::new(QiuiCloud::new(&client_id, &mac, cli.debug));
-                (c.clone(), Arc::new(BlePod { mac: mac.clone(), debug: cli.debug }), Some(c), mac)
+        let mac = pod_mac(cli, &cfg);
+        let pod: Arc<dyn PodLink> = Arc::new(BlePod { mac: mac.clone(), debug: cli.debug });
+        match credential_source(&cfg) {
+            CredentialSource::Sealed(sealed) => {
+                eprintln!("The QIUI credentials are encrypted. Pod control unlocks the first time the keyholder signs in (any keyholder command does it).");
+                let v = Arc::new(LazyCloud::sealed(sealed, &mac, cli.debug));
+                (v.clone(), pod, Some(v), mac)
             }
-            None => {
+            CredentialSource::Plain(id) => {
+                if cfg.has_plain_secrets() {
+                    eprintln!("Warning: the QIUI credentials are stored in plain text. Run `qiui-server config encrypt`.");
+                }
+                let v = Arc::new(LazyCloud::unlocked(Arc::new(QiuiCloud::new(&id, &mac, cli.debug))));
+                (v.clone(), pod, Some(v), mac)
+            }
+            CredentialSource::None => {
                 eprintln!("Note: no QIUI client id configured, so the pod cannot be controlled yet. Run `qiui-server config set-client-id`.");
-                let mac = cli.mac.clone().unwrap_or_else(|| KNOWN_MAC.to_string());
-                (Arc::new(UnconfiguredCloud), Arc::new(BlePod { mac: mac.clone(), debug: cli.debug }), None, mac)
+                (Arc::new(UnconfiguredCloud), pod, None, mac)
             }
         }
     };
 
     // Push notifications: the server's VAPID identity, and a worker that turns audit events into pushes.
     let vapid = Arc::new(Vapid::load_or_create(&root)?);
-    let state = AppState::new(store, auth, Hardware::new(cloud, pod)).with_push_key(vapid.public_key().to_string());
+    let mut state = AppState::new(store, auth, Hardware::new(cloud, pod)).with_push_key(vapid.public_key().to_string());
+    if let Some(v) = &vault {
+        state = state.with_vault(v.clone(), root.clone());
+    }
     let sender = HttpPushSender::new(vapid, cfg.push_contact.as_deref().unwrap_or(DEFAULT_CONTACT));
     let push_state = state.clone();
     tokio::spawn(async move {
@@ -690,7 +830,7 @@ async fn serve(cli: &Cli, bind: SocketAddr, allow_remote: bool, simulate: bool, 
     });
 
     // Keep QIUI's 12-hour platform token fresh, and tell the audit log if that ever stops working.
-    if let Some(qiui) = real_cloud {
+    if let Some(qiui) = vault {
         let token_state = state.clone();
         tokio::spawn(async move {
             let mut healthy = true;
@@ -745,6 +885,47 @@ async fn identify() -> Result<()> {
 mod tests {
     use super::*;
 
+    /// The password given by flag, wherever it is placed, for every command that takes one.
+    #[test]
+    fn the_password_flag_works_before_or_after_the_subcommand_on_every_keyholder_command() {
+        fn password_of(args: &[&str]) -> Option<String> {
+            let cli = Cli::try_parse_from(std::iter::once("qiui-server").chain(args.iter().copied())).unwrap_or_else(|e| panic!("{args:?}: {e}"));
+            match cli.action {
+                Action::Status(a) | Action::Deny(a) | Action::Lock(a) | Action::Unlock(a) | Action::Sync(a) | Action::PairingCode(a) | Action::Devices(a) => a.password,
+                Action::Approve { auth, .. } | Action::Message { auth, .. } | Action::Audit { auth, .. } | Action::RevokeDevice { auth, .. } => auth.password,
+                Action::Timer { auth, .. } | Action::Queue { auth, .. } => auth.password,
+                Action::Config { cmd } => match cmd {
+                    ConfigCmd::SetClientId { auth, .. } | ConfigCmd::SetApiKey { auth, .. } | ConfigCmd::ImportEnv { auth, .. } | ConfigCmd::Encrypt(auth) => auth.password,
+                    ConfigCmd::Show(auth) | ConfigCmd::SetMac { auth, .. } | ConfigCmd::SetPushContact { auth, .. } => auth.password,
+                },
+                _ => panic!("{args:?}: not a command with a password"),
+            }
+        }
+        let with_flag: &[&[&str]] = &[
+            &["status"], &["approve"], &["approve", "--minutes", "5"], &["deny"], &["lock"], &["unlock"], &["sync"],
+            &["timer", "set", "1h"], &["timer", "roll", "1h", "2h"], &["timer", "add", "1h"], &["timer", "add-roll", "1h", "2h"],
+            &["timer", "pause"], &["timer", "resume"], &["timer", "clear"],
+            &["message", "hello"], &["audit"], &["audit", "--limit", "5"],
+            &["queue", "lock"], &["queue", "unlock"], &["queue", "cancel"],
+            &["pairing-code"], &["devices"], &["revoke-device", "3"],
+            &["config", "show"], &["config", "set-mac", "AA:BB"], &["config", "set-push-contact", "mailto:a@b.c"],
+            &["config", "set-client-id", "Client_x"], &["config", "set-api-key", "key"], &["config", "import-env"], &["config", "encrypt"],
+        ];
+        for base in with_flag {
+            // After the whole command...
+            let mut after: Vec<&str> = base.to_vec();
+            after.extend(["--password", "pw"]);
+            assert_eq!(password_of(&after).as_deref(), Some("pw"), "{after:?}");
+            // ...and, for commands with subcommands, right after the command word (`config`'s
+            // subcommands each own their flag, so only "after" applies there).
+            if base[0] != "config" {
+                let mut before: Vec<&str> = vec![base[0], "--password", "pw"];
+                before.extend(&base[1..]);
+                assert_eq!(password_of(&before).as_deref(), Some("pw"), "{before:?}");
+            }
+        }
+    }
+
     #[test]
     fn durations_parse_in_the_forms_people_type() {
         assert_eq!(parse_duration_secs("14d").unwrap(), 14 * 86_400);
@@ -766,11 +947,5 @@ mod tests {
         assert_eq!(fmt_span(13 * 86_400_000 + 51 * 60_000 + 12_000), "13d 00:51:12");
         assert_eq!(fmt_span(90_000), "00:01:30");
         assert_eq!(fmt_span(-5), "00:00:00");
-    }
-
-    #[test]
-    fn secrets_are_masked() {
-        assert_eq!(mask("abc"), "***");
-        assert_eq!(mask("Client_35115347524B"), "Clie…4B (19 chars)");
     }
 }

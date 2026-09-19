@@ -20,10 +20,9 @@ pub const PAIRING_CODE_TTL_MS: i64 = 10 * 60 * 1000;
 const CODE_ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
 const CODE_LEN: usize = 8;
 
-const LOGIN_FREE_ATTEMPTS: u32 = 5;
-const PIN_FREE_ATTEMPTS: u32 = 3;
-const PAIR_FREE_ATTEMPTS: u32 = 5;
-const MAX_LOCKOUT_MS: i64 = 60 * 60 * 1000;
+/// Runs of failed attempts are written to the audit log as one row per this long, with a count.
+/// Nothing is ever blocked or delayed: this only stops a flood of guesses from filling the disk.
+const FAILURE_LOG_WINDOW_MS: i64 = 30_000;
 
 #[derive(Debug, Error)]
 pub enum AuthError {
@@ -33,8 +32,6 @@ pub enum AuthError {
     AlreadyInitialised,
     #[error("that did not match")]
     Invalid,
-    #[error("too many attempts; try again in {} seconds", .retry_after_ms / 1000 + 1)]
-    Locked { retry_after_ms: i64 },
     #[error("{0}")]
     Weak(&'static str),
     #[error("a wearer device is already paired; revoke it first")]
@@ -72,6 +69,14 @@ impl Auth {
 
     pub fn hash_secret(&self, secret: &str) -> Result<String> {
         self.argon().hash_password(secret.as_bytes()).map(|h| h.to_string()).map_err(|_| AuthError::Internal)
+    }
+
+    /// A 32-byte key from a secret: Argon2id keyed with the pepper, so a copy of anything sealed with it
+    /// is useless without both the password and `pepper.key`.
+    pub fn derive_key(&self, secret: &str, salt: &[u8]) -> Result<[u8; 32]> {
+        let mut key = [0u8; 32];
+        self.argon().hash_password_into(secret.as_bytes(), salt, &mut key).map_err(|_| AuthError::Internal)?;
+        Ok(key)
     }
 
     pub fn verify_secret(&self, secret: &str, phc: &str) -> bool {
@@ -115,10 +120,10 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             password_hash TEXT NOT NULL,
             pin_hash TEXT NOT NULL
         );
-        CREATE TABLE IF NOT EXISTS throttle (
-            name TEXT PRIMARY KEY,
-            failures INTEGER NOT NULL,
-            locked_until_ms INTEGER NOT NULL
+        CREATE TABLE IF NOT EXISTS failure_log (
+            kind TEXT PRIMARY KEY,
+            last_logged_ms INTEGER NOT NULL,
+            suppressed INTEGER NOT NULL
         );
         CREATE TABLE IF NOT EXISTS devices (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -150,43 +155,32 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
-// ---------- throttling ----------
+// ---------- failed attempts ----------
+//
+// A wrong password, PIN or pairing code is never punished: no lockout, no delay. The
+// only cost is Argon2's own work per guess. Failures are still recorded.
 
-fn throttle_check(conn: &Connection, name: &str, now_ms: i64) -> Result<()> {
-    let locked: Option<i64> = conn
-        .query_row("SELECT locked_until_ms FROM throttle WHERE name = ?1", [name], |r| r.get(0))
+/// Decide whether this failure gets its own audit row. Returns `Some(n)` (n = failures skipped since the
+/// last row) if it should be logged now, or `None` if it is folded into the next row's count.
+pub fn note_failure(conn: &Connection, kind: &str, now_ms: i64) -> rusqlite::Result<Option<i64>> {
+    let row: Option<(i64, i64)> = conn
+        .query_row("SELECT last_logged_ms, suppressed FROM failure_log WHERE kind = ?1", [kind], |r| Ok((r.get(0)?, r.get(1)?)))
         .optional()?;
-    match locked {
-        Some(until) if until > now_ms => Err(AuthError::Locked { retry_after_ms: until - now_ms }),
-        _ => Ok(()),
+    match row {
+        Some((last, suppressed)) if now_ms >= last && now_ms - last < FAILURE_LOG_WINDOW_MS => {
+            conn.execute("UPDATE failure_log SET suppressed = ?1 WHERE kind = ?2", params![suppressed + 1, kind])?;
+            Ok(None)
+        }
+        other => {
+            let carried = other.map_or(0, |(_, n)| n);
+            conn.execute(
+                "INSERT INTO failure_log (kind, last_logged_ms, suppressed) VALUES (?1, ?2, 0)
+                 ON CONFLICT(kind) DO UPDATE SET last_logged_ms = ?2, suppressed = 0",
+                params![kind, now_ms],
+            )?;
+            Ok(Some(carried))
+        }
     }
-}
-
-/// Count a failure. After `free` failures each further one locks for 1 min,
-/// doubling each time, capped at one hour.
-fn throttle_fail(conn: &Connection, name: &str, now_ms: i64, free: u32) -> Result<()> {
-    let failures: i64 = conn
-        .query_row("SELECT failures FROM throttle WHERE name = ?1", [name], |r| r.get(0))
-        .optional()?
-        .unwrap_or(0)
-        + 1;
-    let over = failures - i64::from(free);
-    let locked_until = if over >= 0 {
-        now_ms + (60_000_i64 << over.min(20)).min(MAX_LOCKOUT_MS)
-    } else {
-        0
-    };
-    conn.execute(
-        "INSERT INTO throttle (name, failures, locked_until_ms) VALUES (?1, ?2, ?3)
-         ON CONFLICT(name) DO UPDATE SET failures = ?2, locked_until_ms = ?3",
-        params![name, failures, locked_until],
-    )?;
-    Ok(())
-}
-
-fn throttle_clear(conn: &Connection, name: &str) -> Result<()> {
-    conn.execute("DELETE FROM throttle WHERE name = ?1", [name])?;
-    Ok(())
 }
 
 // ---------- keyholder ----------
@@ -228,42 +222,30 @@ fn load_hashes(conn: &Connection) -> Result<(String, String)> {
         .ok_or(AuthError::NotInitialised)
 }
 
-/// Verify the keyholder password, counting failures toward a lockout.
-pub fn verify_password_throttled(conn: &Connection, auth: &Auth, password: &str, now_ms: i64) -> Result<()> {
-    throttle_check(conn, "login", now_ms)?;
+/// Check the keyholder password. A wrong one is refused, and that is all: there is no lockout.
+pub fn verify_password(conn: &Connection, auth: &Auth, password: &str) -> Result<()> {
     let (hash, _) = load_hashes(conn)?;
-    if auth.verify_secret(password, &hash) {
-        throttle_clear(conn, "login")?;
-        Ok(())
-    } else {
-        throttle_fail(conn, "login", now_ms, LOGIN_FREE_ATTEMPTS)?;
-        Err(AuthError::Invalid)
-    }
+    if auth.verify_secret(password, &hash) { Ok(()) } else { Err(AuthError::Invalid) }
 }
 
 pub fn login(conn: &Connection, auth: &Auth, password: &str, now_ms: i64) -> Result<String> {
-    verify_password_throttled(conn, auth, password, now_ms)?;
+    verify_password(conn, auth, password)?;
     create_session(conn, Role::Keyholder, None, now_ms, KEYHOLDER_SESSION_MS)
 }
 
 pub fn change_password(conn: &Connection, auth: &Auth, current: &str, new: &str, now_ms: i64) -> Result<()> {
     check_password(new)?;
-    verify_password_throttled(conn, auth, current, now_ms)?;
+    verify_password(conn, auth, current)?;
     set_password(conn, auth, new, now_ms)
 }
 
-/// Local recovery: the recovery PIN authorises a new password. Also clears any
-/// login lockout, since the keyholder may well be locked out.
+/// Local recovery: the recovery PIN authorises a new password.
 pub fn reset_password_with_pin(conn: &Connection, auth: &Auth, pin: &str, new: &str, now_ms: i64) -> Result<()> {
     check_password(new)?;
-    throttle_check(conn, "pin", now_ms)?;
     let (_, pin_hash) = load_hashes(conn)?;
     if !auth.verify_secret(pin, &pin_hash) {
-        throttle_fail(conn, "pin", now_ms, PIN_FREE_ATTEMPTS)?;
         return Err(AuthError::Invalid);
     }
-    throttle_clear(conn, "pin")?;
-    throttle_clear(conn, "login")?;
     set_password(conn, auth, new, now_ms)
 }
 
@@ -374,7 +356,6 @@ fn active_device_exists(conn: &Connection) -> Result<bool> {
 
 /// Exchange a pairing code for a long-lived device token. One active device at a time.
 pub fn pair_device(conn: &Connection, code: &str, device_name: &str, now_ms: i64) -> Result<String> {
-    throttle_check(conn, "pair", now_ms)?;
     let name = device_name.trim();
     let name = if name.is_empty() { "wearer device" } else { name };
     let name: String = name.chars().take(60).collect();
@@ -390,7 +371,6 @@ pub fn pair_device(conn: &Connection, code: &str, device_name: &str, now_ms: i64
         None => false,
     };
     if !valid {
-        throttle_fail(conn, "pair", now_ms, PAIR_FREE_ATTEMPTS)?;
         return Err(AuthError::Invalid);
     }
     if active_device_exists(conn)? {
@@ -400,7 +380,6 @@ pub fn pair_device(conn: &Connection, code: &str, device_name: &str, now_ms: i64
     conn.execute("UPDATE pairing_codes SET used_ms = ?1 WHERE code_hash = ?2", params![now_ms, sha256(&c)])?;
     conn.execute("INSERT INTO devices (name, paired_ms) VALUES (?1, ?2)", params![name, now_ms])?;
     let device_id = conn.last_insert_rowid();
-    throttle_clear(conn, "pair")?;
     create_session(conn, Role::Wearer, Some(device_id), now_ms, DEVICE_SESSION_MS)
 }
 
@@ -467,7 +446,6 @@ mod tests {
 
     const PW: &str = "correct horse battery";
     const PIN: &str = "482913";
-    const MIN: i64 = 60_000;
 
     fn setup() -> (Connection, Auth) {
         let conn = Connection::open_in_memory().unwrap();
@@ -498,7 +476,7 @@ mod tests {
 
         // Dump every text and blob column and look for anything we handed out.
         let mut everything = String::new();
-        for table in ["keyholder", "sessions", "pairing_codes", "devices", "throttle"] {
+        for table in ["keyholder", "sessions", "pairing_codes", "devices", "failure_log"] {
             let mut stmt = conn.prepare(&format!("SELECT * FROM {table}")).unwrap();
             let n = stmt.column_count();
             let mut rows = stmt.query([]).unwrap();
@@ -541,22 +519,43 @@ mod tests {
     }
 
     #[test]
-    fn repeated_bad_logins_lock_the_account_with_growing_delay() {
+    fn wrong_passwords_never_lock_anyone_out() {
         let (conn, auth) = setup();
-        for _ in 0..LOGIN_FREE_ATTEMPTS - 1 {
+        for _ in 0..60 {
             assert!(matches!(login(&conn, &auth, "nope nope nope", 0), Err(AuthError::Invalid)));
         }
-        // The fifth failure triggers the first lock.
-        assert!(matches!(login(&conn, &auth, "nope nope nope", 0), Err(AuthError::Invalid)));
-        // While locked even the right password is refused.
-        match login(&conn, &auth, PW, 10_000) {
-            Err(AuthError::Locked { retry_after_ms }) => assert_eq!(retry_after_ms, MIN - 10_000),
-            other => panic!("expected lockout, got {other:?}"),
+        // Straight after any number of failures, at the same instant, the right password works.
+        assert!(login(&conn, &auth, PW, 0).is_ok());
+        assert!(verify_password(&conn, &auth, PW).is_ok());
+    }
+
+    #[test]
+    fn failures_are_summarised_in_the_log_not_punished() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        // The first failure is logged at once, the next ones inside the window are folded in...
+        assert_eq!(note_failure(&conn, "login_failed", 1_000).unwrap(), Some(0));
+        for t in [2_000, 3_000, 29_999] {
+            assert_eq!(note_failure(&conn, "login_failed", t).unwrap(), None);
         }
-        // After the lock passes, the right password works and clears the count.
-        assert!(login(&conn, &auth, PW, MIN + 1).is_ok());
-        assert!(matches!(login(&conn, &auth, "nope nope nope", MIN + 2), Err(AuthError::Invalid)));
-        assert!(login(&conn, &auth, PW, MIN + 3).is_ok());
+        // ...and the next row after the window says how many were skipped.
+        assert_eq!(note_failure(&conn, "login_failed", 31_000).unwrap(), Some(3));
+        assert_eq!(note_failure(&conn, "login_failed", 31_500).unwrap(), None);
+        // Different kinds are counted separately, and a clock that went backwards does not silence the log.
+        assert_eq!(note_failure(&conn, "pairing_failed", 31_500).unwrap(), Some(0));
+        assert_eq!(note_failure(&conn, "login_failed", 5).unwrap(), Some(1));
+    }
+
+    #[test]
+    fn the_recovery_pin_works_after_any_number_of_wrong_guesses_and_signs_everyone_out() {
+        let (conn, auth) = setup();
+        let old = create_session(&conn, Role::Keyholder, None, 0, KEYHOLDER_SESSION_MS).unwrap();
+        for _ in 0..40 {
+            assert!(matches!(reset_password_with_pin(&conn, &auth, "000000", "another good password", 1), Err(AuthError::Invalid)));
+        }
+        reset_password_with_pin(&conn, &auth, PIN, "another good password", 1).unwrap();
+        assert!(authenticate(&conn, &old, 2).unwrap().is_none());
+        assert!(login(&conn, &auth, "another good password", 2).is_ok());
     }
 
     #[test]
@@ -568,27 +567,6 @@ mod tests {
         assert!(authenticate(&conn, &old, 3).unwrap().is_none());
         assert!(login(&conn, &auth, PW, 4).is_err());
         assert!(login(&conn, &auth, "a brand new password", 5).is_ok());
-    }
-
-    #[test]
-    fn recovery_pin_resets_password_even_when_locked_out_and_is_rate_limited() {
-        let (conn, auth) = setup();
-        for _ in 0..LOGIN_FREE_ATTEMPTS {
-            let _ = login(&conn, &auth, "nope nope nope", 0);
-        }
-        assert!(matches!(login(&conn, &auth, PW, 1), Err(AuthError::Locked { .. })));
-        let old = create_session(&conn, Role::Keyholder, None, 0, KEYHOLDER_SESSION_MS).unwrap();
-
-        // Wrong PINs are throttled.
-        for _ in 0..PIN_FREE_ATTEMPTS {
-            assert!(matches!(reset_password_with_pin(&conn, &auth, "000000", "another good password", 2), Err(AuthError::Invalid)));
-        }
-        assert!(matches!(reset_password_with_pin(&conn, &auth, PIN, "another good password", 3), Err(AuthError::Locked { .. })));
-
-        // After the PIN lock expires the right PIN works, clears the login lock, and revokes sessions.
-        reset_password_with_pin(&conn, &auth, PIN, "another good password", 2 * MIN).unwrap();
-        assert!(authenticate(&conn, &old, 2 * MIN).unwrap().is_none());
-        assert!(login(&conn, &auth, "another good password", 2 * MIN + 1).is_ok());
     }
 
     #[test]
@@ -627,14 +605,13 @@ mod tests {
     }
 
     #[test]
-    fn guessing_pairing_codes_is_throttled() {
+    fn wrong_pairing_codes_never_block_the_real_one() {
         let (conn, _) = setup();
         let real = create_pairing_code(&conn, 0).unwrap();
-        for _ in 0..PAIR_FREE_ATTEMPTS {
+        for _ in 0..40 {
             assert!(matches!(pair_device(&conn, "AAAA-AAAA", "x", 1), Err(AuthError::Invalid)));
         }
-        assert!(matches!(pair_device(&conn, &real, "phone", 2), Err(AuthError::Locked { .. })));
-        assert!(pair_device(&conn, &real, "phone", 2 * MIN).is_ok());
+        assert!(pair_device(&conn, &real, "phone", 2).is_ok());
     }
 
     #[test]

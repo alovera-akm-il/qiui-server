@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 
 use crate::accounts::{self, Auth, AuthError, Principal, Role};
 use crate::audit;
-use crate::cloud::CloudError;
+use crate::cloud::{CloudError, LazyCloud};
 use crate::hardware::{Hardware, Intent, Stage};
 use crate::machine::{self, Actor, Machine};
 use crate::pod::{PodError, PodOp, PodStatus};
@@ -39,16 +39,26 @@ pub struct AppState {
     pub hardware: Arc<Hardware>,
     /// The VAPID public key, when push notifications are set up.
     pub push_key: Option<String>,
+    /// The QIUI credentials, if they are stored encrypted: unlocked by the keyholder's sign-in.
+    pub vault: Option<Arc<LazyCloud>>,
+    /// Where `config.json` lives, so a password change can re-seal the credentials.
+    pub config_root: Option<std::path::PathBuf>,
     pub clock: Arc<dyn Fn() -> i64 + Send + Sync>,
 }
 
 impl AppState {
     pub fn new(store: Store, auth: Auth, hardware: Hardware) -> Self {
-        Self { store: Arc::new(Mutex::new(store)), auth: Arc::new(auth), hardware: Arc::new(hardware), push_key: None, clock: Arc::new(system_now_ms) }
+        Self { store: Arc::new(Mutex::new(store)), auth: Arc::new(auth), hardware: Arc::new(hardware), push_key: None, vault: None, config_root: None, clock: Arc::new(system_now_ms) }
     }
 
     pub fn with_push_key(mut self, key: String) -> Self {
         self.push_key = Some(key);
+        self
+    }
+
+    pub fn with_vault(mut self, vault: Arc<LazyCloud>, config_root: std::path::PathBuf) -> Self {
+        self.vault = Some(vault);
+        self.config_root = Some(config_root);
         self
     }
 
@@ -69,16 +79,15 @@ pub struct ApiError {
     message: String,
     /// Stable machine-readable reason, e.g. "out_of_range", for clients that branch on it.
     code: Option<&'static str>,
-    retry_after_secs: Option<i64>,
 }
 
 impl ApiError {
     fn new(status: StatusCode, message: impl Into<String>) -> Self {
-        Self { status, message: message.into(), code: None, retry_after_secs: None }
+        Self { status, message: message.into(), code: None }
     }
 
     fn coded(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
-        Self { status, message: message.into(), code: Some(code), retry_after_secs: None }
+        Self { status, message: message.into(), code: Some(code) }
     }
 
     fn internal(detail: impl std::fmt::Display) -> Self {
@@ -97,14 +106,7 @@ impl IntoResponse for ApiError {
         if let Some(code) = self.code {
             body["code"] = code.into();
         }
-        if let Some(secs) = self.retry_after_secs {
-            body["retry_after_secs"] = secs.into();
-        }
-        let mut resp = (self.status, Json(body)).into_response();
-        if let Some(secs) = self.retry_after_secs {
-            resp.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from(secs.max(0) as u64));
-        }
-        resp
+        (self.status, Json(body)).into_response()
     }
 }
 
@@ -112,12 +114,6 @@ impl From<AuthError> for ApiError {
     fn from(e: AuthError) -> Self {
         match e {
             AuthError::Invalid => Self::new(StatusCode::UNAUTHORIZED, "That did not match."),
-            AuthError::Locked { retry_after_ms } => Self {
-                status: StatusCode::TOO_MANY_REQUESTS,
-                message: e.to_string(),
-                code: None,
-                retry_after_secs: Some(retry_after_ms / 1000 + 1),
-            },
             AuthError::NotInitialised => Self::new(StatusCode::SERVICE_UNAVAILABLE, "The keyholder account has not been set up yet."),
             AuthError::AlreadyInitialised | AuthError::DeviceAlreadyPaired => Self::new(StatusCode::CONFLICT, e.to_string()),
             AuthError::Weak(msg) => Self::bad_request(msg),
@@ -155,8 +151,17 @@ fn control_lost() -> ApiError {
     )
 }
 
+fn credentials_locked() -> ApiError {
+    ApiError::coded(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "credentials_locked",
+        "The keyholder needs to sign in once after the server starts before the pod can be controlled.",
+    )
+}
+
 fn pod_error(e: PodError) -> ApiError {
     match e {
+        PodError::Locked => credentials_locked(),
         PodError::NotInRange => ApiError::coded(StatusCode::CONFLICT, "out_of_range", e.to_string()),
         PodError::ControlLost => control_lost(),
         PodError::Timeout => ApiError::coded(StatusCode::GATEWAY_TIMEOUT, "pod_timeout", e.to_string()),
@@ -166,6 +171,7 @@ fn pod_error(e: PodError) -> ApiError {
 
 fn cloud_error(e: CloudError) -> ApiError {
     match e {
+        CloudError::Locked => credentials_locked(),
         CloudError::BoundElsewhere => control_lost(),
         CloudError::Other(m) => ApiError::coded(StatusCode::BAD_GATEWAY, "cloud_error", m),
     }
@@ -308,13 +314,22 @@ struct LoginReq {
 }
 
 async fn keyholder_login(State(st): State<AppState>, Json(req): Json<LoginReq>) -> ApiResult {
+    let vault = st.vault.clone();
     db(&st, move |store, auth, now| match accounts::login(store.connection(), auth, &req.password, now) {
         Ok(token) => {
             store.log(now, "keyholder", "login", &json!({}))?;
+            // The password is right there: use it to decrypt the QIUI credentials into memory.
+            if let Some(vault) = &vault {
+                match vault.unlock(auth, &req.password) {
+                    Ok(true) => store.log(now, "system", "credentials_unlocked", &json!({}))?,
+                    Ok(false) => {}
+                    Err(e) => store.log(now, "system", "credentials_unlock_failed", &json!({ "error": e.to_string() }))?,
+                }
+            }
             Ok(Json(json!({ "token": token, "expires_in_secs": accounts::KEYHOLDER_SESSION_MS / 1000 })))
         }
         Err(AuthError::Invalid) => {
-            store.log(now, "system", "login_failed", &json!({}))?;
+            store.log_failure(now, "system", "login_failed")?;
             Err(AuthError::Invalid.into())
         }
         Err(e) => Err(e.into()),
@@ -336,7 +351,7 @@ async fn wearer_pair(State(st): State<AppState>, Json(req): Json<PairReq>) -> Ap
             Ok(Json(json!({ "token": token })))
         }
         Err(AuthError::Invalid) => {
-            store.log(now, "system", "pairing_failed", &json!({}))?;
+            store.log_failure(now, "system", "pairing_failed")?;
             Err(AuthError::Invalid.into())
         }
         Err(e) => Err(e.into()),
@@ -581,10 +596,28 @@ struct PasswordReq {
 }
 
 async fn kh_change_password(State(st): State<AppState>, Json(req): Json<PasswordReq>) -> ApiResult {
+    let config_root = st.config_root.clone();
     db(&st, move |store, auth, now| {
         accounts::change_password(store.connection(), auth, &req.current_password, &req.new_password, now)?;
         store.log(now, "keyholder", "password_changed", &json!({}))?;
-        Ok(Json(json!({ "changed": true, "note": "All sessions were signed out. Sign in again." })))
+        // The sealed QIUI credentials are keyed to the password, so they must move to the new one.
+        let credentials = match &config_root {
+            None => "none",
+            Some(root) => match crate::datadir::reseal_config(root, auth, &req.current_password, &req.new_password) {
+                Ok(true) => "resealed",
+                Ok(false) => "none",
+                Err(e) => {
+                    store.log(now, "system", "credentials_reseal_failed", &json!({ "error": e.to_string() }))?;
+                    "failed"
+                }
+            },
+        };
+        let note = if credentials == "failed" {
+            "The password was changed, but the QIUI credentials could not be re-encrypted. Run `qiui-server config set-client-id` again."
+        } else {
+            "All sessions were signed out. Sign in again."
+        };
+        Ok(Json(json!({ "changed": true, "credentials": credentials, "note": note })))
     })
     .await
 }
@@ -1328,18 +1361,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bad_logins_are_throttled_with_retry_after() {
+    async fn wrong_passwords_never_lock_the_keyholder_out_and_the_log_summarises_them() {
         let h = harness();
-        for _ in 0..5 {
-            let (s, _) = h.call("POST", "/api/keyholder/login", None, Some(json!({ "password": "not the password" }))).await;
+        for _ in 0..40 {
+            let (s, v) = h.call("POST", "/api/keyholder/login", None, Some(json!({ "password": "not the password" }))).await;
             assert_eq!(s, StatusCode::UNAUTHORIZED);
+            assert!(v.get("retry_after_secs").is_none());
         }
-        let (s, v) = h.call("POST", "/api/keyholder/login", None, Some(json!({ "password": PW }))).await;
-        assert_eq!(s, StatusCode::TOO_MANY_REQUESTS);
-        assert!(v["retry_after_secs"].as_i64().unwrap() > 0);
-        h.advance(2 * MIN);
-        let (s, _) = h.call("POST", "/api/keyholder/login", None, Some(json!({ "password": PW }))).await;
-        assert_eq!(s, StatusCode::OK);
+        // Straight after, at the same instant, the right password works.
+        let kh = h.keyholder().await;
+
+        // Forty failures made one log row, not forty; the next one after the window carries the count.
+        h.advance(31_000);
+        h.call("POST", "/api/keyholder/login", None, Some(json!({ "password": "still wrong" }))).await;
+        let (_, a) = h.call("GET", "/api/keyholder/audit?limit=200", Some(&kh), None).await;
+        let rows: Vec<&Value> = a["entries"].as_array().unwrap().iter().filter(|e| e["kind"] == "login_failed").collect();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0]["detail"]["suppressed"], 39, "the newest row says how many were folded in");
+        assert_eq!(rows[1]["detail"]["suppressed"], 0);
     }
 
     #[tokio::test]
@@ -2007,6 +2046,136 @@ mod tests {
         crate::push::notify_once(&h.state, &sender).await;
         let titles: Vec<String> = sender.sent().iter().map(|n| n["title"].as_str().unwrap().to_string()).collect();
         assert!(titles.contains(&"Timer extended".to_string()), "{titles:?}");
+    }
+
+    // ---------- encrypted QIUI credentials ----------
+
+    struct VaultHarness {
+        h: Harness,
+        vault: Arc<LazyCloud>,
+        dir: std::path::PathBuf,
+    }
+
+    /// A server whose QIUI credentials are sealed under the keyholder's password, as after `config set-client-id`.
+    fn vault_harness(name: &str) -> VaultHarness {
+        use crate::secrets::Secrets;
+        let dir = std::env::temp_dir().join(format!("qiui-vault-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let auth = Auth::for_tests(b"api test pepper");
+        let mut cfg = crate::datadir::Config::default();
+        cfg.seal_secrets(&auth, PW, &Secrets { client_id: Some("Client_VAULT_TEST".into()), api_key: None }).unwrap();
+        crate::datadir::save_config(&dir, &cfg).unwrap();
+
+        let store = Store::open_in_memory().unwrap();
+        accounts::init_keyholder(store.connection(), &auth, PW, PIN).unwrap();
+        let now = Arc::new(AtomicI64::new(1_000_000));
+        let clock = now.clone();
+        let pod = Arc::new(FakePod::default());
+        let vault = Arc::new(LazyCloud::sealed(cfg.secrets.clone().unwrap(), "AA:BB:CC:DD:EE:FF", false));
+        let mut state = AppState::new(store, auth, Hardware::new(vault.clone(), pod.clone())).with_vault(vault.clone(), dir.clone());
+        state.clock = Arc::new(move || clock.load(Ordering::SeqCst));
+        let h = Harness { app: router(state.clone()), now, pod, cloud: Arc::new(FakeCloud::default()), state };
+        VaultHarness { h, vault, dir }
+    }
+
+    impl VaultHarness {
+        /// The server restarts: same database, credentials sealed and locked again.
+        fn restart(&self) -> (Harness, Arc<LazyCloud>) {
+            let sealed = crate::datadir::load_config(&self.dir).unwrap().secrets.unwrap();
+            let vault = Arc::new(LazyCloud::sealed(sealed, "AA:BB:CC:DD:EE:FF", false));
+            let mut state = self.h.state.clone();
+            state.hardware = Arc::new(Hardware::new(vault.clone(), self.h.pod.clone()));
+            state.vault = Some(vault.clone());
+            (Harness { app: router(state.clone()), now: self.h.now.clone(), pod: self.h.pod.clone(), cloud: self.h.cloud.clone(), state }, vault)
+        }
+    }
+
+    #[tokio::test]
+    async fn the_credentials_stay_locked_until_the_keyholder_signs_in_with_the_right_password() {
+        let v = vault_harness("unlock");
+        assert!(!v.vault.is_unlocked());
+
+        let (s, _) = v.h.call("POST", "/api/keyholder/login", None, Some(json!({ "password": "not the password" }))).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
+        assert!(!v.vault.is_unlocked(), "a wrong password must not unlock anything");
+
+        let kh = v.h.keyholder().await;
+        assert!(v.vault.is_unlocked());
+        assert!(v.h.audit_kinds(&kh).await.contains(&"credentials_unlocked".to_string()));
+    }
+
+    #[tokio::test]
+    async fn after_a_restart_pod_control_fails_fast_without_touching_bluetooth_until_the_keyholder_signs_in() {
+        let v = vault_harness("restart");
+        let kh = v.h.keyholder().await;
+        let w = v.h.wearer(&kh).await;
+        v.h.approved(&kh, &w).await;
+
+        let (after, vault) = v.restart();
+        assert!(!vault.is_unlocked());
+
+        // The wearer's session survives the restart, but pod control does not, and says why.
+        let (s, body) = after.call("POST", "/api/wearer/unlock", Some(&w), None).await;
+        assert_eq!((s, body["code"].as_str()), (StatusCode::SERVICE_UNAVAILABLE, Some("credentials_locked")));
+        let (s, body) = after.call("POST", "/api/wearer/relay/start", Some(&w), Some(json!({ "intent": "unlock" }))).await;
+        assert_eq!((s, body["code"].as_str()), (StatusCode::SERVICE_UNAVAILABLE, Some("credentials_locked")));
+        assert!(after.pod.ops().is_empty(), "a locked server must not even scan for the pod");
+
+        // Accounts, timers and messages still work while locked.
+        let (s, _) = after.call("GET", "/api/wearer/state", Some(&w), None).await;
+        assert_eq!(s, StatusCode::OK);
+
+        // The keyholder signs in: decrypted in memory, and the wearer's approved unlock now goes through.
+        let (s, body) = after.call("POST", "/api/keyholder/login", None, Some(json!({ "password": PW }))).await;
+        assert_eq!(s, StatusCode::OK, "{body}");
+        assert!(vault.is_unlocked());
+        let (s, body) = after.call("POST", "/api/wearer/unlock", Some(&w), None).await;
+        assert_eq!((s, body["lock"].as_str()), (StatusCode::OK, Some("unlocked")));
+    }
+
+    #[tokio::test]
+    async fn changing_the_password_moves_the_sealed_credentials_to_the_new_one() {
+        let v = vault_harness("change");
+        let kh = v.h.keyholder().await;
+        let (s, body) = v
+            .h
+            .call("POST", "/api/keyholder/password", Some(&kh), Some(json!({ "current_password": PW, "new_password": "a brand new password" })))
+            .await;
+        assert_eq!((s, body["credentials"].as_str()), (StatusCode::OK, Some("resealed")), "{body}");
+
+        let sealed = crate::datadir::load_config(&v.dir).unwrap();
+        let auth = Auth::for_tests(b"api test pepper");
+        assert!(sealed.secrets(&auth, PW).is_err(), "the old password must no longer open the credentials");
+        assert_eq!(sealed.secrets(&auth, "a brand new password").unwrap().client_id.as_deref(), Some("Client_VAULT_TEST"));
+
+        // And the next start unlocks with the new password only.
+        let (after, vault) = v.restart();
+        after.call("POST", "/api/keyholder/login", None, Some(json!({ "password": PW }))).await;
+        assert!(!vault.is_unlocked());
+        after.call("POST", "/api/keyholder/login", None, Some(json!({ "password": "a brand new password" }))).await;
+        assert!(vault.is_unlocked());
+        let _ = std::fs::remove_dir_all(&v.dir);
+    }
+
+    #[tokio::test]
+    async fn if_the_credentials_cannot_be_resealed_the_keyholder_is_told_and_it_is_logged() {
+        let v = vault_harness("reseal-fail");
+        // The file was sealed under some other password than the keyholder's current one.
+        let auth = Auth::for_tests(b"api test pepper");
+        let mut cfg = crate::datadir::load_config(&v.dir).unwrap();
+        cfg.seal_secrets(&auth, "some other password", &crate::secrets::Secrets { client_id: Some("Client_X".into()), api_key: None }).unwrap();
+        crate::datadir::save_config(&v.dir, &cfg).unwrap();
+
+        let kh = v.h.keyholder().await;
+        let (s, body) = v
+            .h
+            .call("POST", "/api/keyholder/password", Some(&kh), Some(json!({ "current_password": PW, "new_password": "a brand new password" })))
+            .await;
+        assert_eq!((s, body["credentials"].as_str()), (StatusCode::OK, Some("failed")));
+        assert!(body["note"].as_str().unwrap().contains("config set-client-id"));
+        let kh2 = v.h.call("POST", "/api/keyholder/login", None, Some(json!({ "password": "a brand new password" }))).await.1["token"].as_str().unwrap().to_string();
+        assert!(v.h.audit_kinds(&kh2).await.contains(&"credentials_reseal_failed".to_string()));
+        let _ = std::fs::remove_dir_all(&v.dir);
     }
 
     #[tokio::test]

@@ -8,9 +8,11 @@ use async_trait::async_trait;
 use thiserror::Error;
 use tokio::sync::Mutex;
 
+use crate::accounts::Auth;
 use crate::api::system_now_ms;
 use crate::client::{ApiCodeError, BOUND_ELSEWHERE_CODES, DeviceInfo, QiuiClient};
 use crate::pod::PodStatus;
+use crate::secrets::{self, SealedSecrets, SecretsError};
 
 /// Renew this long before the token runs out.
 const REFRESH_MARGIN_MS: i64 = 30 * 60 * 1000;
@@ -22,6 +24,9 @@ pub enum CloudError {
     /// The pod is now bound in the consumer app or on another platform.
     #[error("the pod is bound outside this server")]
     BoundElsewhere,
+    /// The credentials are encrypted and the keyholder has not signed in since the server started.
+    #[error("the QIUI credentials are encrypted until the keyholder signs in")]
+    Locked,
     #[error("{0}")]
     Other(String),
 }
@@ -35,6 +40,10 @@ fn classify(e: anyhow::Error) -> CloudError {
 
 #[async_trait]
 pub trait Cloud: Send + Sync {
+    /// Can this cloud be used right now? Lets callers fail fast, before spending a Bluetooth scan.
+    async fn is_ready(&self) -> Result<(), CloudError> {
+        Ok(())
+    }
     async fn device_token_cmd(&self) -> Result<String, CloudError>;
     async fn decrypt_reply(&self, reply_hex: &str) -> Result<PodStatus, CloudError>;
     async fn unlock_cmd(&self) -> Result<String, CloudError>;
@@ -169,5 +178,77 @@ impl Cloud for SimulatedCloud {
     }
     async fn lock_cmd(&self) -> Result<String, CloudError> {
         Ok("5503".into())
+    }
+}
+
+/// A cloud whose credentials may still be encrypted. It starts locked when they are, and the first
+/// successful keyholder sign-in decrypts them into memory. Nothing decrypted is ever written to disk.
+pub struct LazyCloud {
+    inner: std::sync::RwLock<Option<Arc<QiuiCloud>>>,
+    sealed: Option<SealedSecrets>,
+    mac: String,
+    debug: bool,
+}
+
+impl LazyCloud {
+    /// Credentials already in hand (an old plain-text config, or the environment).
+    pub fn unlocked(cloud: Arc<QiuiCloud>) -> Self {
+        Self { inner: std::sync::RwLock::new(Some(cloud)), sealed: None, mac: String::new(), debug: false }
+    }
+
+    pub fn sealed(sealed: SealedSecrets, mac: &str, debug: bool) -> Self {
+        Self { inner: std::sync::RwLock::new(None), sealed: Some(sealed), mac: mac.to_string(), debug }
+    }
+
+    pub fn is_unlocked(&self) -> bool {
+        self.inner.read().expect("vault lock").is_some()
+    }
+
+    pub fn qiui(&self) -> Option<Arc<QiuiCloud>> {
+        self.inner.read().expect("vault lock").clone()
+    }
+
+    /// Decrypt with the keyholder's password. `Ok(true)` if this unlocked it, `Ok(false)` if there was
+    /// nothing to do. A wrong password leaves it locked.
+    pub fn unlock(&self, auth: &Auth, password: &str) -> Result<bool, SecretsError> {
+        if self.is_unlocked() {
+            return Ok(false);
+        }
+        let Some(sealed) = &self.sealed else { return Ok(false) };
+        let opened = secrets::open(auth, password, sealed)?;
+        let client_id = opened.client_id.clone().ok_or(SecretsError::NoClientId)?;
+        *self.inner.write().expect("vault lock") = Some(Arc::new(QiuiCloud::new(&client_id, &self.mac, self.debug)));
+        Ok(true)
+    }
+
+    /// Renew QIUI's token if it is close to expiring. A locked vault has nothing to renew.
+    pub async fn refresh_token_if_needed(&self) -> Result<Option<i64>, CloudError> {
+        match self.qiui() {
+            Some(c) => c.refresh_token_if_needed().await,
+            None => Ok(None),
+        }
+    }
+
+    fn get(&self) -> Result<Arc<QiuiCloud>, CloudError> {
+        self.qiui().ok_or(CloudError::Locked)
+    }
+}
+
+#[async_trait]
+impl Cloud for LazyCloud {
+    async fn is_ready(&self) -> Result<(), CloudError> {
+        self.get().map(|_| ())
+    }
+    async fn device_token_cmd(&self) -> Result<String, CloudError> {
+        self.get()?.device_token_cmd().await
+    }
+    async fn decrypt_reply(&self, reply_hex: &str) -> Result<PodStatus, CloudError> {
+        self.get()?.decrypt_reply(reply_hex).await
+    }
+    async fn unlock_cmd(&self) -> Result<String, CloudError> {
+        self.get()?.unlock_cmd().await
+    }
+    async fn lock_cmd(&self) -> Result<String, CloudError> {
+        self.get()?.lock_cmd().await
     }
 }

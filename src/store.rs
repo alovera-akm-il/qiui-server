@@ -65,6 +65,16 @@ impl Store {
         load(&self.conn)
     }
 
+    /// Record a failed attempt (wrong password, PIN or pairing code). Runs of them are summarised, one
+    /// row per 30 s with a count, so guessing cannot flood the log. Nothing here blocks or delays anyone.
+    pub fn log_failure(&self, now_ms: i64, actor: &str, kind: &str) -> rusqlite::Result<()> {
+        // Counted per actor as well as per kind, so a flood through one route cannot hide the other's first failure.
+        match crate::accounts::note_failure(&self.conn, &format!("{actor}:{kind}"), now_ms)? {
+            Some(skipped) => self.log(now_ms, actor, kind, &serde_json::json!({ "suppressed": skipped })),
+            None => Ok(()),
+        }
+    }
+
     /// Remember when the pod was last reached, and how. Battery is stored only if the pod reported one.
     pub fn save_pod_status(&self, now_ms: i64, via: &str, battery: Option<i64>) -> rusqlite::Result<()> {
         let battery = battery.filter(|b| *b > 0);
@@ -196,6 +206,20 @@ mod tests {
         for ext in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
         }
+    }
+
+    #[test]
+    fn failed_attempts_are_summarised_per_route_and_never_block_anything() {
+        let s = Store::open_in_memory().unwrap();
+        for t in 0..200 {
+            s.log_failure(1_000 + t, "system", "login_failed").unwrap();
+        }
+        // The other route's first failure still gets its own row.
+        s.log_failure(1_500, "local-cli", "login_failed").unwrap();
+        let rows = audit::entries(s.connection(), 100).unwrap();
+        assert_eq!(rows.len(), 2, "200 failures through the API and 1 through the CLI");
+        assert!(rows.iter().any(|r| r.actor == "local-cli"));
+        assert_eq!(audit::verify(s.connection()).unwrap(), None);
     }
 
     #[test]

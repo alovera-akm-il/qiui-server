@@ -80,16 +80,30 @@ keyed hashes are. The PIN is the only way to reset a forgotten password, and onl
 ### 3. Tell it about QIUI and the pod
 
 ```
-qiui-server config set-client-id        # prompts, hidden
+qiui-server config set-client-id        # prompts, hidden; asks for your keyholder password
 qiui-server config set-mac E5:26:D6:6E:B6:8A
-qiui-server config show                 # secrets are masked
+qiui-server config show                 # nothing secret is ever displayed
 ```
 
-Coming from the old Python scripts? `qiui-server config import-env ~/qiui-keypod/.qiui_pod_env` copies the client
-id and API key across. Credentials live in `config.json` in the data directory, readable only by you. That is file
-permissions, not encryption.
+**The QIUI client id and API key are stored encrypted.** They are sealed in `config.json` with a key derived from
+your keyholder password (and the server's `pepper.key`), so a copy of the file or the disk is useless without the
+password. The server keeps them in memory only, and never writes anything decrypted back to disk.
 
-Check the pod is reachable (wake it first by pressing its button; it sleeps after about 10 minutes):
+- **After the server starts,** pod control is locked. Accounts, timers, messages and the wearer's app all work, but
+  Bluetooth commands are refused with "the keyholder needs to sign in once". The first keyholder sign-in decrypts the
+  credentials in memory (any keyholder command signs in, so `qiui-server status` is enough). The audit log records
+  `credentials_unlocked`.
+- **Changing your password** (through the API) re-encrypts them under the new one.
+- **Resetting it with the recovery PIN** cannot: a 6 to 12 digit PIN is far too weak to protect them. The reset
+  removes the sealed credentials, and you enter them again with `config set-client-id`.
+- **An older `config.json` with plain-text credentials** keeps working, with a warning. `qiui-server config encrypt`
+  migrates it and removes the plain-text copy.
+
+Coming from the old Python scripts? `qiui-server config import-env ~/qiui-keypod/.qiui_pod_env` copies the client id
+and API key across, encrypted.
+
+Check the pod is reachable (wake it first by pressing its button; it sleeps after about 10 minutes). With the server
+not running this asks for your keyholder password, which it needs to decrypt the credentials:
 
 ```
 qiui-server sync
@@ -126,7 +140,7 @@ receive notifications.
 qiui-server pairing-code
 ```
 
-Read the code to the wearer. It works once, for 10 minutes, and a new code replaces it. Only **one device** can be
+(It asks for your password.) Read the code to the wearer. It works once, for 10 minutes, and a new code replaces it. Only **one device** can be
 paired at a time; to swap phones, `qiui-server devices` then `qiui-server revoke-device <id>` first.
 
 ---
@@ -135,6 +149,24 @@ paired at a time; to swap phones, `qiui-server devices` then `qiui-server revoke
 
 Every command below signs in for you. Give the password with `QIUI_KEYHOLDER_PASSWORD` (best for scripts) or
 `--password` (visible in `ps` and shell history, so the tool warns you), or type it when asked.
+
+### Which commands take the password
+
+**Everything needs the keyholder password except the recovery route.** `--password` (or `QIUI_KEYHOLDER_PASSWORD`,
+which is safer) works anywhere on the line, so `timer set 1h --password …` is as good as `timer --password … set 1h`.
+A wrong password is refused and recorded in the audit log. **There is no lockout and no delay**: the right password
+works immediately, however many wrong ones came before it.
+
+| Commands | Password |
+|---|---|
+| `status`, `approve`, `deny`, `lock`, `unlock`, `sync`, `timer …`, `queue …`, `message`, `audit` | `--password` |
+| `pairing-code`, `devices`, `revoke-device` | `--password` |
+| every `config …` command (`show`, `set-client-id`, `set-api-key`, `set-mac`, `set-push-contact`, `import-env`, `encrypt`) | `--password`; the credentials are also encrypted under it |
+| `reset-password` | The recovery route: `--pin` and `--new-password`, no password |
+| `init` | Only works before an account exists, so there is no password yet: `--password` is the **new** one, and `--pin` the new recovery PIN |
+| `serve`, `identify` | none. `serve` only starts the process (pod control stays locked until you sign in), and `identify` just scans Bluetooth and touches nothing |
+
+With no terminal and no `QIUI_KEYHOLDER_PASSWORD` set, a command that needs the password says so instead of hanging.
 
 ![A keyholder session in the terminal](images/cli-keyholder.gif)
 
@@ -159,10 +191,12 @@ Every command below signs in for you. Give the password with `QIUI_KEYHOLDER_PAS
 | `audit [--limit N]` | The audit log, newest first |
 | `pairing-code`, `devices`, `revoke-device <id>` | Manage the wearer's device |
 | `reset-password` | Reset the password with the recovery PIN |
-| `config …` | QIUI credentials and pod address |
+| `config …` | `show`, `set-client-id`, `set-api-key`, `set-mac`, `set-push-contact`, `import-env`, `encrypt` |
 
 `lock`, `unlock` and `sync` also work with the server **stopped**: the CLI then talks to the pod directly, applying
-the same rules. That is your fallback if the server is down. The other commands need the server running.
+the same rules. That is your fallback if the server is down. Because the QIUI credentials are encrypted, this
+direct mode always asks for your password (`sync` too), which it uses to decrypt them. The other commands need the
+server running.
 
 ### Timers
 
@@ -206,13 +240,42 @@ Two events deserve attention:
 - `control_lost`: QIUI says the pod is now bound outside this server, for example the wearer re-paired it to the
   QiUi app. The server cannot prevent that; it can only tell you.
 
+**Every event the log can contain** (`actor` is who did it; `system` means the server itself):
+
+| Event | Actor | Meaning |
+|---|---|---|
+| `unlock_requested`, `request_cancelled` | wearer | The wearer asked to be unlocked, or withdrew the request |
+| `unlock_approved`, `request_denied` | keyholder | You approved (with its expiry) or turned down a request |
+| `approval_revoked` | keyholder | An unused approval was withdrawn, or a timer started and cancelled it |
+| `approval_expired` | system | An approval ran out unused |
+| `unlocked`, `locked` | wearer or keyholder | The pod was unlocked or locked; `via` is `server`, `phone` or `direct` |
+| `timer_set`, `timer_rolled` | keyholder | A timer started, with its length or its range and the rolled result |
+| `timer_extended`, `timer_extension_rolled` | keyholder | Time was added, or a random amount (range and result recorded) |
+| `timer_paused`, `timer_resumed`, `timer_cleared` | keyholder | |
+| `timer_ended` | system | A timer reached zero. This reopens requests; it unlocks nothing |
+| `command_queued`, `command_cancelled` | keyholder | A lock or unlock was queued for later, or the queue was cancelled |
+| `queued_command_done`, `queued_command_dropped` | system | A queued command ran (`via` says how), or was dropped because the rules no longer allowed it |
+| `relay_unlock_issued` | system | Unlock bytes were handed to the wearer's phone |
+| `control_lost` | system | QIUI says the pod is now bound outside this server |
+| `message_sent` | keyholder | You sent a message (its id, not its text) |
+| `login`, `password_changed` | keyholder | Sign-ins and password changes |
+| `login_failed`, `pairing_failed`, `password_reset_failed` | system or local-cli | A wrong password, pairing code or recovery PIN. Runs of them are summarised: one row per route per 30 seconds, with `suppressed` counting the ones folded in |
+| `keyholder_initialised`, `password_reset` | local-cli | Account setup and recovery-PIN resets |
+| `pairing_code_created`, `device_revoked` | keyholder or local-cli | Managing the wearer's device |
+| `device_paired` | wearer | The wearer paired a device |
+| `push_subscribed`, `push_unsubscribed` | wearer | Notifications turned on or off |
+| `credentials_sealed`, `credentials_cleared` | local-cli | The QIUI credentials were stored encrypted, or removed after a PIN reset |
+| `credentials_unlocked`, `credentials_unlock_failed` | system | They were decrypted at sign-in, or could not be |
+| `credentials_reseal_failed` | system | A password change could not re-encrypt them; re-enter them with `config set-client-id` |
+| `platform_token_failed`, `platform_token_recovered` | system | QIUI's 12-hour token could not be renewed, or renewal works again |
+
 ### Forgotten password
 
 ```
 qiui-server reset-password        # asks for the recovery PIN, then a new password
 ```
 
-Run it on the server machine. Wrong PINs lock out for growing periods, a successful reset signs out every
+Run it on the server machine. Wrong PINs are refused and logged (there is no lockout), and a successful reset signs out every
 keyholder session, and the reset is recorded in the audit log as `local-cli`.
 
 ---
@@ -226,7 +289,7 @@ keyholder session, and the reset is recorded in the audit log as `local-cli`.
 ### Installing and pairing
 
 Open the server's HTTPS address in the phone's browser, choose **Add to Home Screen**, then enter the pairing code
-the keyholder gives you. A wrong code is refused with a message and counts toward a lockout.
+the keyholder gives you. A wrong code is refused with a message, and never blocks the real one.
 
 <img src="images/app-pair.png" alt="Pairing screen" width="260">
 
@@ -333,17 +396,31 @@ wearer token is refused on every keyholder route (a test tries each one).
 **Secrets.** Passwords and the recovery PIN are Argon2id hashes keyed with a *pepper* stored outside the database;
 session tokens and pairing codes are stored only as SHA-256 hashes. A copied database reveals none of them. Back
 up `pepper.key` together with the database, or every stored hash becomes unverifiable. Failed logins, PIN guesses
-and pairing guesses lock out for growing periods.
+and pairing guesses are never locked out or delayed, so a strong password matters: the only cost to a guesser is the password hash's own work (a fraction of a second per guess). Failures are still logged, summarised to one row per 30 seconds with a count so guessing cannot flood the log.
 
 **The web app.** It is served with a strict Content-Security-Policy (no inline scripts or styles, and it may only talk to
 this server), and the device token lives in the browser's local storage. Push notification URLs come from the
 wearer's device, so the server only sends to https addresses on the known push services (Google, Mozilla, Apple,
 Microsoft) and never follows redirects; otherwise a wearer could aim the server at something inside your network.
 
+**The QIUI credentials.** They are the most valuable thing on the machine: the client id lets anyone ask QIUI for
+commands for your pod. They are encrypted at rest (XChaCha20-Poly1305, key from your password through Argon2id, mixed
+with the pepper) and decrypted only in memory. The limits: a process with access to the running server's memory, or
+root on the machine, can still read them; and until the keyholder signs in after a restart, the pod cannot be
+controlled at all. The API key is stored the same way, though nothing currently uses it.
+
 **Not protected:**
 
-- **Anyone with a shell on the server machine** can reset the password (with the PIN), read the QIUI credentials,
-  and use the CLI. Treat the machine as keyholder-only.
+- **Anyone with a shell on the server machine** cannot pair a device, revoke one, change a setting or touch the pod
+  without your password, and cannot read the QIUI client id from disk. They can reset the keyholder password if they
+  know the recovery PIN (which wipes the encrypted QIUI credentials, so the pod stays uncontrollable until you
+  re-enter them). Root, or anything that can read the server's memory while it runs, can still see decrypted
+  values. Treat the machine as keyholder-only.
+- **Nothing limits password guessing.** By your choice there is no lockout, so anyone who can reach the API (the
+  wearer, over your tailnet) can try passwords as fast as the server can check them, a few per second. That removes
+  the risk of being locked out of your own server, and leaves the strength of your password as the only protection:
+  use a long passphrase, not a short word. The recovery PIN is weaker still, but resetting needs a shell on the
+  server. Failures are logged, so a guessing run is visible in `audit`.
 - **Phone relay leaks unlock bytes to the wearer's phone.** Testing showed the bytes only work on the connection
   they were made for, and rarely on another (a few hundred possible states, so roughly a 1-in-several-hundred
   chance per reconnect for someone holding captured bytes). Exploiting that needs the wearer to extract the bytes
@@ -368,6 +445,8 @@ The evidence behind these statements is in [`RESEARCH.md`](../RESEARCH.md) §10.
 | "the pod is not within Bluetooth range of the server" | The pod is asleep (press its button; it sleeps after about 10 minutes idle) or too far from the server's adapter |
 | First connect after waking fails, second works | Normal for this pod; the server retries once automatically |
 | `control_lost` / "bound outside this server" | QIUI codes `500025` or `500059`: the pod is bound to another platform or the QiUi app. Unbind it there, then it can be used again |
+| "The keyholder needs to sign in once after the server starts" (`credentials_locked`) | Normal after a restart: the QIUI credentials are encrypted until you sign in. Run any keyholder command, such as `qiui-server status` |
+| After a PIN reset: "no QIUI client id stored" | The reset had to remove the encrypted credentials. Run `qiui-server config set-client-id` again |
 | "QIUI credentials are not configured" | Run `qiui-server config set-client-id` and restart `serve` |
 | QIUI error `500032` / `500033` (no command returned) | QIUI has no session state for the pod yet: a handshake reply must be decrypted first. The server always does this; if you see it, retry after a fresh `sync` |
 | A timer blocks `unlock` | Working as designed: `timer clear` first |
@@ -383,14 +462,14 @@ The evidence behind these statements is in [`RESEARCH.md`](../RESEARCH.md) §10.
 ## API reference
 
 All bodies are JSON. Errors look like `{"error": "…", "code": "…"}` (`code` appears for cases a client may want to
-branch on: `out_of_range`, `control_lost`, `pod_timeout`, `pod_error`, `cloud_error`, `relay_expired`, `push_unavailable`). Every
+branch on: `out_of_range`, `control_lost`, `pod_timeout`, `pod_error`, `cloud_error`, `relay_expired`, `push_unavailable`, `credentials_locked`). Every
 response carries `Cache-Control: no-store`. Authenticate with `Authorization: Bearer <token>`.
 
 ### Sign-in
 
 | Method and path | Body | Result |
 |---|---|---|
-| `POST /api/keyholder/login` | `{"password"}` | `{"token", "expires_in_secs"}` (8 hours). Throttled: `429` with `retry_after_secs` |
+| `POST /api/keyholder/login` | `{"password"}` | `{"token", "expires_in_secs"}` (8 hours). A wrong password gets `401`; there is no lockout |
 | `POST /api/wearer/pair` | `{"code", "device_name"}` | `{"token"}` for that device (about 400 days, until revoked) |
 
 ### Keyholder routes (`/api/keyholder/…`)
@@ -471,7 +550,7 @@ The directory is mode 0700 and the files 0600; the server refuses to start if th
 |---|---|
 | `qiui.db` | SQLite: lock state, accounts, sessions, queue, messages, audit log (WAL mode) |
 | `pepper.key` | 32 random bytes that key the password hashes. Back it up with the database |
-| `config.json` | QIUI client id, API key, pod address, push contact |
+| `config.json` | Pod address, push contact, and the QIUI client id and API key **encrypted** under your keyholder password |
 | `vapid.key` | The server's push-signing key, created on first run |
 
 QIUI's 12-hour platform token is kept **in memory only** and renewed about 30 minutes before it expires (checked every
@@ -480,7 +559,7 @@ live credential ever sits in the database. If renewal fails, `platform_token_fai
 
 | Variable | Used by |
 |---|---|
-| `QIUI_KEYHOLDER_PASSWORD` | `init`, `lock`, `unlock`, `sync`, and every keyholder command |
+| `QIUI_KEYHOLDER_PASSWORD` | `init` (the new password), every keyholder command, and `config set-client-id`, `set-api-key`, `import-env`, `encrypt` |
 | `QIUI_RECOVERY_PIN`, `QIUI_NEW_PASSWORD` | `init`, `reset-password` |
 | `QIUI_CLIENT_ID`, `QIUI_API_KEY` | `config set-client-id`, `config set-api-key` |
 | `QIUI_DATA_DIR` | Where the state lives |

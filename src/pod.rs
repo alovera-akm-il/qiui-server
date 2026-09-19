@@ -55,6 +55,8 @@ pub enum PodError {
     Cloud(String),
     #[error("control of the pod was lost: it is now bound outside this server")]
     ControlLost,
+    #[error("the QIUI credentials are encrypted until the keyholder signs in")]
+    Locked,
     #[error("the pod answered with something unexpected")]
     Unexpected,
     #[error("the pod did not answer in time")]
@@ -65,6 +67,7 @@ impl From<CloudError> for PodError {
     fn from(e: CloudError) -> Self {
         match e {
             CloudError::BoundElsewhere => PodError::ControlLost,
+            CloudError::Locked => PodError::Locked,
             CloudError::Other(m) => PodError::Cloud(m),
         }
     }

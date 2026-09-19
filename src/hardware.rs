@@ -56,6 +56,8 @@ impl Hardware {
 
     /// One short session over the server's own Bluetooth. Never two at once.
     pub async fn direct(&self, op: PodOp) -> Result<PodStatus, PodError> {
+        // Fail before spending a Bluetooth scan on a session that cannot get its commands.
+        self.cloud.is_ready().await?;
         let _one_at_a_time = self.gate.lock().await;
         self.pod.run(&*self.cloud, op).await
     }

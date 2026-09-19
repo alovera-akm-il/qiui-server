@@ -19,7 +19,7 @@ Real screens, taken against the built-in demo pod.*
 - **A web app for the wearer** that installs from the browser, keeps the countdown running offline, and sends
   notifications.
 - **Short Bluetooth sessions.** Connect, run one command, disconnect.
-- **Everything is logged** in a tamper-evident audit log. Passwords are never stored; the database holds only keyed hashes.
+- **Everything is logged** in a tamper-evident audit log. Passwords are never stored (only keyed hashes), and the QIUI credentials are kept encrypted under the keyholder's password.
 
 ![A keyholder session in the terminal](docs/images/cli-keyholder.gif)
 
@@ -28,7 +28,7 @@ Real screens, taken against the built-in demo pod.*
 ```
 cargo build --release
 qiui-server init                          # keyholder password + recovery PIN
-qiui-server config set-client-id          # your QIUI client id
+qiui-server config set-client-id          # your QIUI client id (stored encrypted)
 qiui-server config set-mac E5:26:D6:6E:B6:8A
 qiui-server serve                         # http://127.0.0.1:8443; put HTTPS in front for phones
 qiui-server pairing-code                  # one-time code for the wearer's phone

@@ -10,6 +10,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::accounts::{self, Auth};
+use crate::secrets::{self, SealedSecrets, Secrets};
 use crate::store::Store;
 
 pub fn resolve(arg: Option<PathBuf>) -> Result<PathBuf> {
@@ -55,15 +56,45 @@ fn load_pepper(dir: &Path) -> Result<Vec<u8>> {
     }
 }
 
-/// QIUI credentials and the pod's address. Stored owner-only in the data directory, next to the
-/// database. This is a plain 0600 file, not encryption: anyone who can read your files can read it.
+/// The pod's address, push contact, and the QIUI credentials. The credentials are stored **sealed**
+/// (see `secrets.rs`): encrypted under a key derived from the keyholder's password. The plain
+/// `client_id` and `api_key` fields exist only to read a file written before that, and are removed
+/// as soon as it is migrated with `qiui-server config encrypt`.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Config {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
     pub mac: Option<String>,
     /// `mailto:` or https address push services can reach if this server misbehaves.
     pub push_contact: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secrets: Option<SealedSecrets>,
+}
+
+impl Config {
+    /// True if a credential is still stored in the clear (an old config that has not been migrated).
+    pub fn has_plain_secrets(&self) -> bool {
+        self.client_id.is_some() || self.api_key.is_some()
+    }
+
+    /// The credentials, decrypted into memory with the keyholder's password. A config that is
+    /// still plain text is read as it is, so nothing breaks before it is migrated.
+    pub fn secrets(&self, auth: &Auth, password: &str) -> Result<Secrets, secrets::SecretsError> {
+        match &self.secrets {
+            Some(sealed) => secrets::open(auth, password, sealed),
+            None => Ok(Secrets { client_id: self.client_id.clone(), api_key: self.api_key.clone() }),
+        }
+    }
+
+    /// Replace the credentials with a sealed copy and remove every plain-text trace of them.
+    pub fn seal_secrets(&mut self, auth: &Auth, password: &str, secrets: &Secrets) -> Result<(), secrets::SecretsError> {
+        self.secrets = Some(secrets::seal(auth, password, secrets)?);
+        self.client_id = None;
+        self.api_key = None;
+        Ok(())
+    }
 }
 
 pub fn load_config(root: &Path) -> Result<Config> {
@@ -84,6 +115,28 @@ pub fn save_config(root: &Path, cfg: &Config) -> Result<()> {
     f.sync_all()?;
     fs::rename(&tmp, root.join("config.json"))?;
     Ok(())
+}
+
+/// Re-encrypt the sealed credentials under a new password (after a password change).
+/// Returns false if there was nothing sealed.
+pub fn reseal_config(root: &Path, auth: &Auth, old_password: &str, new_password: &str) -> Result<bool> {
+    let mut cfg = load_config(root)?;
+    let Some(sealed) = &cfg.secrets else { return Ok(false) };
+    let secrets = secrets::open(auth, old_password, sealed)?;
+    cfg.seal_secrets(auth, new_password, &secrets)?;
+    save_config(root, &cfg)?;
+    Ok(true)
+}
+
+/// Drop the sealed credentials (after a PIN reset they cannot be opened any more).
+/// Returns false if there was nothing sealed.
+pub fn clear_sealed(root: &Path) -> Result<bool> {
+    let mut cfg = load_config(root)?;
+    if cfg.secrets.take().is_none() {
+        return Ok(false);
+    }
+    save_config(root, &cfg)?;
+    Ok(true)
 }
 
 pub fn open(root: &Path) -> Result<(Store, Auth)> {
@@ -125,13 +178,100 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    fn cfg_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("qiui-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn secrets() -> Secrets {
+        Secrets { client_id: Some("Client_SEALME_0123456789".into()), api_key: Some("APIKEY_SEALME_9876".into()) }
+    }
+
+    #[test]
+    fn sealed_credentials_never_reach_the_file_in_the_clear_and_the_file_stays_private() {
+        let dir = cfg_dir("sealed");
+        let auth = Auth::for_tests(b"config pepper");
+        let mut cfg = Config { mac: Some("AA:BB".into()), ..Config::default() };
+        cfg.seal_secrets(&auth, "keyholder password", &secrets()).unwrap();
+        save_config(&dir, &cfg).unwrap();
+
+        let raw = fs::read_to_string(dir.join("config.json")).unwrap();
+        for plain in ["Client_SEALME", "APIKEY_SEALME", "\"client_id\"", "\"api_key\""] {
+            assert!(!raw.contains(plain), "{plain} found in config.json:\n{raw}");
+        }
+        assert!(raw.contains("\"secrets\"") && raw.contains("AA:BB"));
+        assert_eq!(fs::metadata(dir.join("config.json")).unwrap().permissions().mode() & 0o777, 0o600);
+
+        let loaded = load_config(&dir).unwrap();
+        assert!(!loaded.has_plain_secrets());
+        let back = loaded.secrets(&auth, "keyholder password").unwrap();
+        assert_eq!(back.client_id.as_deref(), Some("Client_SEALME_0123456789"));
+        assert!(loaded.secrets(&auth, "not the password").is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_plain_text_config_still_works_until_it_is_migrated_and_migrating_removes_the_plain_text() {
+        let dir = cfg_dir("migrate");
+        let auth = Auth::for_tests(b"config pepper");
+        let old = Config { client_id: Some("Client_OLDPLAIN_1".into()), api_key: Some("KEY_OLDPLAIN".into()), mac: Some("AA:BB".into()), ..Config::default() };
+        save_config(&dir, &old).unwrap();
+        let mut cfg = load_config(&dir).unwrap();
+        assert!(cfg.has_plain_secrets());
+        assert_eq!(cfg.secrets(&auth, "anything").unwrap().client_id.as_deref(), Some("Client_OLDPLAIN_1"), "readable without a password until migrated");
+
+        let secrets = cfg.secrets(&auth, "pw pw pw pw pw").unwrap();
+        cfg.seal_secrets(&auth, "pw pw pw pw pw", &secrets).unwrap();
+        save_config(&dir, &cfg).unwrap();
+        assert!(!fs::read_to_string(dir.join("config.json")).unwrap().contains("OLDPLAIN"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn changing_the_password_reseals_the_credentials_and_a_pin_reset_clears_them() {
+        let dir = cfg_dir("reseal");
+        let auth = Auth::for_tests(b"config pepper");
+        let mut cfg = Config::default();
+        cfg.seal_secrets(&auth, "old password!", &secrets()).unwrap();
+        save_config(&dir, &cfg).unwrap();
+
+        assert!(reseal_config(&dir, &auth, "old password!", "new password!").unwrap());
+        let loaded = load_config(&dir).unwrap();
+        assert!(loaded.secrets(&auth, "old password!").is_err(), "the old password must stop working");
+        assert_eq!(loaded.secrets(&auth, "new password!").unwrap().api_key.as_deref(), Some("APIKEY_SEALME_9876"));
+        assert!(reseal_config(&dir, &auth, "wrong", "whatever!!").is_err(), "a wrong old password reseals nothing");
+
+        assert!(clear_sealed(&dir).unwrap());
+        assert!(load_config(&dir).unwrap().secrets.is_none());
+        assert!(!clear_sealed(&dir).unwrap());
+        assert!(!reseal_config(&dir, &auth, "a", "b").unwrap(), "nothing sealed, nothing to do");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn setting_other_values_leaves_the_sealed_block_untouched() {
+        let dir = cfg_dir("preserve");
+        let auth = Auth::for_tests(b"config pepper");
+        let mut cfg = Config::default();
+        cfg.seal_secrets(&auth, "pw pw pw pw pw", &secrets()).unwrap();
+        let before = cfg.secrets.clone();
+        save_config(&dir, &cfg).unwrap();
+
+        let mut again = load_config(&dir).unwrap();
+        again.mac = Some("CC:DD".into());
+        save_config(&dir, &again).unwrap();
+        assert_eq!(load_config(&dir).unwrap().secrets, before);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn config_round_trips_privately_and_a_loose_file_is_refused() {
         let dir = std::env::temp_dir().join(format!("qiui-config-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         assert!(load_config(&dir).unwrap().client_id.is_none());
 
-        save_config(&dir, &Config { client_id: Some("Client_x".into()), api_key: None, mac: Some("AA:BB".into()), push_contact: None }).unwrap();
+        save_config(&dir, &Config { client_id: Some("Client_x".into()), api_key: None, mac: Some("AA:BB".into()), push_contact: None, secrets: None }).unwrap();
         assert_eq!(fs::metadata(dir.join("config.json")).unwrap().permissions().mode() & 0o777, 0o600);
         let back = load_config(&dir).unwrap();
         assert_eq!((back.client_id.as_deref(), back.mac.as_deref()), (Some("Client_x"), Some("AA:BB")));
