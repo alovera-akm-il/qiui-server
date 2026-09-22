@@ -520,8 +520,35 @@ async fn pod_action(cli: &Cli, auth: &PasswordArg, what: &str) -> Result<()> {
 
 fn resolve_config(cli: &Cli) -> Result<(PathBuf, Config)> {
     let root = datadir::resolve(cli.data_dir.clone())?;
+    warn_if_likely_wrong_data_dir(cli, &root);
     let cfg = datadir::load_config(&root)?;
     Ok((root, cfg))
+}
+
+/// `scripts/deploy.sh` installs the service with its data pinned to `/var/lib/qiui-server`
+/// (see `deploy/qiui-server.service`) and gives you `qiui-ctl` to reach it. Nothing stops
+/// anyone from instead running the plain `qiui-server` binary on the same machine, which
+/// silently resolves to a *different* directory (`~/.local/share/qiui-server` by default) —
+/// commands "succeed" there, but the running service never sees them. Catch that here rather
+/// than let it surface later as `credentials_locked` / "not configured" from the server.
+fn warn_if_likely_wrong_data_dir(cli: &Cli, root: &std::path::Path) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+
+    if cli.data_dir.is_some() || std::env::var_os("QIUI_DATA_DIR").is_some() {
+        return; // explicitly chosen: trust it, even if it happens to differ
+    }
+    let service_dir = std::path::Path::new("/var/lib/qiui-server");
+    if std::path::Path::new("/etc/qiui-server").exists() && root != service_dir && !WARNED.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "Warning: this machine has qiui-server installed as a system service, whose data lives in {}.\n\
+             This command is using {} instead, so a running service will not see the change.\n\
+             Use `qiui-ctl` (installed by scripts/deploy.sh) instead of `qiui-server`, or pass --data-dir {}.\n",
+            service_dir.display(),
+            root.display(),
+            service_dir.display(),
+        );
+    }
 }
 
 /// Where the QIUI client id comes from.
@@ -626,7 +653,9 @@ fn rule_error(e: ApplyError) -> anyhow::Error {
 // ---------- account administration (local shell only) ----------
 
 fn open_store(cli: &Cli) -> Result<(Store, accounts::Auth)> {
-    datadir::open(&datadir::resolve(cli.data_dir.clone())?)
+    let root = datadir::resolve(cli.data_dir.clone())?;
+    warn_if_likely_wrong_data_dir(cli, &root);
+    datadir::open(&root)
 }
 
 fn init(cli: &Cli, password: Option<String>, pin: Option<String>) -> Result<()> {
@@ -785,7 +814,7 @@ fn config(cli: &Cli, cmd: &ConfigCmd) -> Result<()> {
 
 fn save_plain(root: &std::path::Path, cfg: &Config) -> Result<()> {
     datadir::save_config(root, cfg)?;
-    println!("Saved. Restart a running server for the change to take effect.");
+    println!("Saved to {}. Restart a running server for the change to take effect.", root.display());
     Ok(())
 }
 
@@ -802,7 +831,7 @@ fn seal_credentials(cli: &Cli, root: &std::path::Path, cfg: &mut Config, auth: &
     cfg.seal_secrets(&auth_obj, &password, &secrets).map_err(|e| anyhow!("{e}"))?;
     datadir::save_config(root, cfg)?;
     store.log(system_now_ms(), "local-cli", "credentials_sealed", &json!({}))?;
-    println!("Saved, encrypted under your keyholder password. Restart a running server for the change to take effect.");
+    println!("Saved to {}, encrypted under your keyholder password. Restart a running server for the change to take effect.", root.display());
     Ok(())
 }
 
