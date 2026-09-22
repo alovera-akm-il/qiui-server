@@ -97,9 +97,12 @@ fi
 say "installing qiui-ctl (the keyholder command line for this service)"
 $SUDO tee "$CTL" >/dev/null <<CTLEOF
 #!/bin/sh
-# Runs qiui-server as the service user against the installed service's data.
-# Needed for anything that touches the data directly (init, reset-password, config).
-exec sudo -u $USER_NAME env QIUI_DATA_DIR=$DATA $BIN "\$@"
+# Runs qiui-server as the service user against the installed service's data,
+# and talks to the port the service actually listens on (from QIUI_BIND in
+# $ETC/service.env, default 8443) rather than a hardcoded guess — so this
+# still works after \`qiui-server config set-...\` or a manual --bind change.
+PORT=\$(sed -n 's/^QIUI_BIND=.*:\([0-9]*\)\$/\1/p' $ETC/service.env 2>/dev/null | tail -n1)
+exec sudo -u $USER_NAME env QIUI_DATA_DIR=$DATA QIUI_SERVER="http://127.0.0.1:\${PORT:-8443}" $BIN "\$@"
 CTLEOF
 $SUDO chmod 0755 "$CTL"
 
