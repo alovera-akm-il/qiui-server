@@ -139,8 +139,12 @@ async function act(name, fn) {
   try {
     await fn();
   } catch (e) {
+    // Any failure to reach the pod over the server's own Bluetooth (out of range, no
+    // adapter, a stuck connection) is worth offering the phone for, not just the exact
+    // "not in range" case — the wearer doesn't need to know why the server couldn't do it.
+    const podUnreachable = ['out_of_range', 'pod_error', 'pod_timeout'].includes(e.code);
     if (e.offline) app.notice = { tone: 'error', text: "You're offline. Try again when you have a connection." };
-    else if (e.code === 'out_of_range') app.needRelay = { intent: name };
+    else if (podUnreachable && (name === 'unlock' || name === 'lock')) app.needRelay = { intent: name };
     else app.notice = { tone: 'error', text: e.message };
   }
   app.busy = null;
