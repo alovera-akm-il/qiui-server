@@ -48,7 +48,7 @@ command -v systemctl >/dev/null || { echo "systemd is required" >&2; exit 1; }
 if [ "$uninstall" = 1 ]; then
   say "stopping and removing the service"
   $SUDO systemctl disable --now "$SERVICE" 2>/dev/null || true
-  $SUDO rm -f "$UNIT" "$BIN" "$CTL"
+  $SUDO rm -f "$UNIT" "$BIN" "$CTL" /etc/sudoers.d/qiui-ctl-env
   $SUDO rm -rf "$DOCS"
   $SUDO systemctl daemon-reload
   if [ "$purge" = 1 ]; then
@@ -102,9 +102,23 @@ $SUDO tee "$CTL" >/dev/null <<CTLEOF
 # $ETC/service.env, default 8443) rather than a hardcoded guess — so this
 # still works after \`qiui-server config set-...\` or a manual --bind change.
 PORT=\$(sed -n 's/^QIUI_BIND=.*:\([0-9]*\)\$/\1/p' $ETC/service.env 2>/dev/null | tail -n1)
-exec sudo -u $USER_NAME env QIUI_DATA_DIR=$DATA QIUI_SERVER="http://127.0.0.1:\${PORT:-8443}" $BIN "\$@"
+# --preserve-env carries these from your shell into the sudo'd process without ever putting the
+# value in argv (so it never shows in \`ps\` or shell history) — allowed only for this exact binary,
+# via /etc/sudoers.d/qiui-ctl-env.
+exec sudo -u $USER_NAME --preserve-env=QIUI_KEYHOLDER_PASSWORD,QIUI_RECOVERY_PIN,QIUI_NEW_PASSWORD,QIUI_NEW_PIN \\
+  env QIUI_DATA_DIR=$DATA QIUI_SERVER="http://127.0.0.1:\${PORT:-8443}" $BIN "\$@"
 CTLEOF
 $SUDO chmod 0755 "$CTL"
+
+# Let qiui-ctl's `sudo --preserve-env=...` (above) actually carry the QIUI_* secrets through: sudo
+# refuses to preserve any variable that isn't explicitly allowed, and only for this one binary.
+say "allowing qiui-ctl to pass QIUI_* secrets through sudo without exposing them in argv"
+SUDOERS_D=/etc/sudoers.d/qiui-ctl-env
+TMP_SUDOERS="$(mktemp)"
+printf 'Defaults!%s env_keep += "QIUI_KEYHOLDER_PASSWORD QIUI_RECOVERY_PIN QIUI_NEW_PASSWORD QIUI_NEW_PIN"\n' "$BIN" > "$TMP_SUDOERS"
+$SUDO visudo -c -f "$TMP_SUDOERS" >/dev/null
+$SUDO install -m 0440 -o root -g root "$TMP_SUDOERS" "$SUDOERS_D"
+rm -f "$TMP_SUDOERS"
 
 say "loading the service"
 $SUDO systemctl daemon-reload

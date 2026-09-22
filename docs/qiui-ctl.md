@@ -5,7 +5,8 @@ wrapper**, not a different program:
 
 ```sh
 #!/bin/sh
-exec sudo -u qiui env QIUI_DATA_DIR=/var/lib/qiui-server /usr/local/bin/qiui-server "$@"
+exec sudo -u qiui --preserve-env=QIUI_KEYHOLDER_PASSWORD,QIUI_RECOVERY_PIN,QIUI_NEW_PASSWORD,QIUI_NEW_PIN \
+  env QIUI_DATA_DIR=/var/lib/qiui-server QIUI_SERVER=… /usr/local/bin/qiui-server "$@"
 ```
 
 It runs the same `qiui-server` binary, as the `qiui` service user, pointed at the service's own data directory
@@ -35,12 +36,28 @@ service is installed.
 | Data directory | always `/var/lib/qiui-server` (the real service's data) | `~/.local/share/qiui-server` by default — **not** the service's data, unless you pass `--data-dir`/`QIUI_DATA_DIR` yourself |
 | Right tool for | every keyholder command, on the machine running the service | development only: `cargo run`, `serve --simulate-pod`, or a machine with no service installed |
 
-Because it goes through `sudo`, **environment variables from your shell are not passed through** (sudo resets the
-environment by default). `QIUI_KEYHOLDER_PASSWORD` set in your shell will *not* reach the command — give the
-password with `--password`, or answer the prompt. (Scripts that must be non-interactive can invoke `sudo -u qiui env
-QIUI_DATA_DIR=/var/lib/qiui-server QIUI_KEYHOLDER_PASSWORD=… /usr/local/bin/qiui-server …` directly, bypassing the
-wrapper, but then the password is visible in `ps` for the duration of the call — prefer a short-lived shell and
-`unset` it immediately after.)
+`sudo` resets the environment by default, but `scripts/deploy.sh` also installs a scoped sudoers drop-in,
+`/etc/sudoers.d/qiui-ctl-env`:
+
+```
+Defaults!/usr/local/bin/qiui-server env_keep += "QIUI_KEYHOLDER_PASSWORD QIUI_RECOVERY_PIN QIUI_NEW_PASSWORD QIUI_NEW_PIN"
+```
+
+That's what lets the wrapper's `--preserve-env=…` above actually work: those four variables, and only those, pass
+through from your shell into the `qiui-server` process — **as environment, never as an argument**, so they never
+appear in `ps` output or shell history. A `.env` file works exactly like it would running `qiui-server` directly:
+
+```sh
+source ~/old_pass.env      # sets QIUI_KEYHOLDER_PASSWORD (and/or QIUI_RECOVERY_PIN)
+qiui-ctl status             # picks it up silently
+```
+
+`--password`/`--pin` on the command line still work too, but are visible in `ps` and shell history for as long as
+they're there — the CLI warns you about that when it detects a secret flag on the line. If you ever need a variable
+that isn't in that list to reach the sudo'd process, either add it to the sudoers drop-in and the wrapper's
+`--preserve-env=…` list (rebuild by re-running `scripts/deploy.sh`), or fall back to
+`sudo -u qiui env QIUI_DATA_DIR=/var/lib/qiui-server SOME_VAR=… /usr/local/bin/qiui-server …` directly — but then
+that value *is* visible in `ps` for the duration of the call.
 
 ---
 
@@ -282,7 +299,7 @@ silent run, or drop `--quiet` to also get the usual status line on stdout.
 | `Error: QIUI's cloud refused: ... QIUI code 500037: 平台ClientId无效` ("invalid ClientId") | The stored client id is not one QIUI recognizes. Common cause: it was sealed with stray characters — e.g. surrounding quotes copied in from a `KEY="value"`-style `.env` file. Re-run `config set-client-id` with the bare value (no quotes) and restart |
 | `credentials_locked` / "the keyholder needs to sign in once" | Normal right after a restart: sealed credentials are locked until a keyholder sign-in. Run `qiui-ctl status` |
 | A `config` command reports success but nothing changes for the running service | You ran plain `qiui-server` instead of `qiui-ctl` (or `qiui-ctl` without going through `sudo -u qiui`), and it wrote to the wrong data directory. Re-run through `qiui-ctl`, and check the `Saved to …` line names `/var/lib/qiui-server` |
-| `QIUI_KEYHOLDER_PASSWORD` set in the shell is ignored by `qiui-ctl` | Expected — `sudo` resets the environment. Use `--password` or the interactive prompt |
+| `QIUI_KEYHOLDER_PASSWORD` set in the shell is ignored by `qiui-ctl` | Check `/etc/sudoers.d/qiui-ctl-env` exists (`scripts/deploy.sh` installs it) — without it, `sudo` resets the environment and you need `--password` or the interactive prompt instead |
 | "the pod is not within Bluetooth range of the server" | Pod asleep (press its button; sleeps after ~10 min idle) or out of range |
 | `control_lost` / "bound outside this server" | QIUI codes `500025`/`500059`: the pod is bound to the consumer app or another platform. Unbind it there |
 | A timer blocks `unlock` | Working as designed — `qiui-ctl timer clear` first |
@@ -310,7 +327,7 @@ which is why a restart re-locks pod control until you run any keyholder command 
 
 | Variable | Used by |
 |---|---|
-| `QIUI_KEYHOLDER_PASSWORD` | Any keyholder command — but not through `qiui-ctl` (sudo drops it); use `--password` |
+| `QIUI_KEYHOLDER_PASSWORD` | Any keyholder command, including through `qiui-ctl` (preserved through `sudo` via `/etc/sudoers.d/qiui-ctl-env`) |
 | `QIUI_RECOVERY_PIN`, `QIUI_NEW_PASSWORD` | `init`, `reset-password` |
 | `QIUI_NEW_PIN` | `reset-password` — choose the next recovery PIN yourself instead of getting a generated one |
 | `QIUI_CLIENT_ID`, `QIUI_API_KEY` | `config set-client-id`, `config set-api-key` |

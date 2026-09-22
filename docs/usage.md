@@ -91,7 +91,13 @@ It does not touch Tailscale, other web servers or firewalls.
 The service runs as a dedicated `qiui` user with no login, in the `bluetooth` group, with a locked-down sandbox
 (read-only system, no home directory, no extra privileges, network limited to IP and local sockets).
 
-Use `qiui-ctl` in place of `qiui-server` for everything, since only the service user can read the data. It runs through `sudo`, which drops environment variables, so give the password with `--password` or type it at the prompt (`QIUI_KEYHOLDER_PASSWORD` does not get through):
+Use `qiui-ctl` in place of `qiui-server` for everything, since only the service user can read the data. It runs
+through `sudo`, which drops environment variables by default — but `qiui-ctl` explicitly asks sudo to preserve
+`QIUI_KEYHOLDER_PASSWORD`, `QIUI_RECOVERY_PIN`, `QIUI_NEW_PASSWORD` and `QIUI_NEW_PIN` (via
+`/etc/sudoers.d/qiui-ctl-env`, installed by `scripts/deploy.sh`, scoped to exactly the `qiui-server` binary), so a
+`.env` file you `source` works the same as it would running `qiui-server` directly — the value never touches argv
+(`ps`) or shell history. `--password` on the command line still works too, but is visible in `ps` and history while
+the command runs, which is why the CLI warns about it:
 
 ```
 qiui-ctl init                     # first time only
