@@ -120,7 +120,8 @@ enum Action {
         #[arg(long, env = "QIUI_RECOVERY_PIN", hide_env_values = true)]
         pin: Option<String>,
     },
-    /// Reset the keyholder password using the recovery PIN
+    /// Reset the keyholder password using the recovery PIN. The PIN is one-time: a successful
+    /// reset retires it and issues a new one, printed once, unless --new-pin is given.
     ResetPassword {
         /// Recovery PIN (prefer the QIUI_RECOVERY_PIN environment variable)
         #[arg(long, env = "QIUI_RECOVERY_PIN", hide_env_values = true)]
@@ -128,6 +129,16 @@ enum Action {
         /// The new password (prefer the QIUI_NEW_PASSWORD environment variable)
         #[arg(long, env = "QIUI_NEW_PASSWORD", hide_env_values = true)]
         new_password: Option<String>,
+        /// Choose the next recovery PIN yourself (6 to 12 digits) instead of getting a generated one
+        #[arg(long, env = "QIUI_NEW_PIN", hide_env_values = true)]
+        new_pin: Option<String>,
+        /// Print nothing but the new PIN on success (nothing at all if --new-pin was given), for scripting
+        #[arg(short, long)]
+        quiet: bool,
+        /// Instead of printing the new PIN, write it (with the new password) to FILE as KEY=value
+        /// lines, e.g. --env-file ~/new_creds.env. Created (or overwritten) with mode 600.
+        #[arg(long, value_name = "FILE")]
+        env_file: Option<PathBuf>,
     },
     /// Print a one-time code to pair the wearer's device (needs the keyholder password)
     PairingCode(PasswordArg),
@@ -239,7 +250,9 @@ async fn main() -> Result<()> {
         Action::Queue { cmd, auth } => queue(&cli, auth, cmd).await,
         Action::Serve { bind, simulate_pod, simulate_out_of_range } => serve(&cli, *bind, *simulate_pod, !*simulate_out_of_range).await,
         Action::Init { password, pin } => init(&cli, password.clone(), pin.clone()),
-        Action::ResetPassword { pin, new_password } => reset_password(&cli, pin.clone(), new_password.clone()),
+        Action::ResetPassword { pin, new_password, new_pin, quiet, env_file } => {
+            reset_password(&cli, pin.clone(), new_password.clone(), new_pin.clone(), *quiet, env_file.clone())
+        }
         Action::PairingCode(a) => pairing_code(&cli, a),
         Action::Devices(a) => devices(&cli, a),
         Action::RevokeDevice { id, auth } => revoke_device(&cli, auth, *id),
@@ -273,7 +286,7 @@ fn new_secret(given: Option<String>, what: &str) -> Result<String> {
 
 /// Flags put secrets in the process list and shell history. Say so, once.
 fn warn_if_secret_on_command_line() {
-    let inline = std::env::args().any(|a| ["--password", "--pin", "--new-password"].iter().any(|f| a == *f || a.starts_with(&format!("{f}="))));
+    let inline = std::env::args().any(|a| ["--password", "--pin", "--new-password", "--new-pin"].iter().any(|f| a == *f || a.starts_with(&format!("{f}="))));
     if inline {
         eprintln!("Warning: a secret on the command line is visible to other users (ps) and saved in shell history. Prefer the QIUI_* environment variables.");
     }
@@ -677,7 +690,30 @@ fn init(cli: &Cli, password: Option<String>, pin: Option<String>) -> Result<()> 
     Ok(())
 }
 
-fn reset_password(cli: &Cli, pin: Option<String>, new_password: Option<String>) -> Result<()> {
+/// Write credentials to FILE as plain `KEY=value` lines (the same shape `client::load_env` reads),
+/// created or overwritten with mode 600 since the file holds secrets.
+fn write_env_file(path: &std::path::Path, password: &str, pin: &str) -> Result<()> {
+    let contents = format!("QIUI_KEYHOLDER_PASSWORD={password}\nQIUI_RECOVERY_PIN={pin}\n");
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(path).with_context(|| format!("writing {}", path.display()))?;
+    std::io::Write::write_all(&mut file, contents.as_bytes())?;
+    Ok(())
+}
+
+fn reset_password(
+    cli: &Cli,
+    pin: Option<String>,
+    new_password: Option<String>,
+    new_pin: Option<String>,
+    quiet: bool,
+    env_file: Option<PathBuf>,
+) -> Result<()> {
     let (store, auth) = open_store(cli)?;
     let now = system_now_ms();
     let pin = secret(pin, "Recovery PIN: ")?;
@@ -685,13 +721,40 @@ fn reset_password(cli: &Cli, pin: Option<String>, new_password: Option<String>) 
     match accounts::reset_password_with_pin(store.connection(), &auth, &pin, &new, now) {
         Ok(()) => {
             store.log(now, "local-cli", "password_reset", &json!({}))?;
-            println!("Password reset. Every keyholder session was signed out.");
+            if !quiet {
+                println!("Password reset. Every keyholder session was signed out.");
+            }
             // The QIUI credentials are encrypted under the old password, and a recovery PIN is far too weak
             // to protect them, so they cannot be carried over.
             if datadir::clear_sealed(&datadir::resolve(cli.data_dir.clone())?)? {
                 store.log(now, "local-cli", "credentials_cleared", &json!({}))?;
-                println!("The encrypted QIUI credentials could not be carried over to the new password and were removed.");
-                println!("Enter them again: qiui-server config set-client-id");
+                if !quiet {
+                    println!("The encrypted QIUI credentials could not be carried over to the new password and were removed.");
+                    println!("Enter them again: qiui-server config set-client-id");
+                }
+            }
+            // The PIN that just authorised this reset is retired here, so it cannot be replayed:
+            // it behaves as a one-time code, not a standing secret.
+            let generated = new_pin.is_none();
+            let fresh_pin = new_pin.unwrap_or_else(accounts::generate_pin);
+            accounts::rotate_pin(store.connection(), &auth, &fresh_pin)?;
+            store.log(now, "local-cli", "pin_rotated", &json!({}))?;
+            if let Some(path) = &env_file {
+                write_env_file(path, &new, &fresh_pin)?;
+                if !quiet {
+                    println!("Wrote the new password and recovery PIN to {}", path.display());
+                }
+            } else {
+                match (quiet, generated) {
+                    (true, true) => println!("{fresh_pin}"),
+                    (true, false) => {}
+                    (false, true) => {
+                        println!();
+                        println!("The recovery PIN you just used is now retired. New recovery PIN: {fresh_pin}");
+                        println!("Write it down now; it will not be shown again.");
+                    }
+                    (false, false) => println!("Recovery PIN updated."),
+                }
             }
             Ok(())
         }

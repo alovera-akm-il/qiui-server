@@ -120,7 +120,8 @@ qiui-server init
 ```
 
 You choose a **password** (at least **16 characters**; a long passphrase is easiest) and a **recovery PIN** (6 to 12 digits). Neither is stored: only
-keyed hashes are. The PIN is the only way to reset a forgotten password, and only from this machine.
+keyed hashes are. The PIN is the only way to reset a forgotten password, and only from this machine. It is one-time:
+using it to reset the password retires it and issues a new one — see [Forgotten password](#forgotten-password).
 
 ### 3. Tell it about QIUI and the pod
 
@@ -225,7 +226,7 @@ works immediately, however many wrong ones came before it.
 | `status`, `approve`, `deny`, `lock`, `unlock`, `sync`, `timer …`, `queue …`, `message`, `audit` | `--password` |
 | `pairing-code`, `devices`, `revoke-device` | `--password` |
 | every `config …` command (`show`, `set-client-id`, `set-api-key`, `set-mac`, `set-push-contact`, `set-max-devices`, `import-env`, `encrypt`) | `--password`; the credentials are also encrypted under it |
-| `reset-password` | The recovery route: `--pin` and `--new-password`, no password |
+| `reset-password` | The recovery route: `--pin` and `--new-password`, no password. Also rotates the PIN — see [Forgotten password](#forgotten-password) |
 | `init` | Only works before an account exists, so there is no password yet: `--password` is the **new** one, and `--pin` the new recovery PIN |
 | `serve`, `identify` | none. `serve` only starts the process (pod control stays locked until you sign in), and `identify` just scans Bluetooth and touches nothing |
 
@@ -253,7 +254,7 @@ With no terminal and no `QIUI_KEYHOLDER_PASSWORD` set, a command that needs the 
 | `message "text"` | Send the wearer a message (up to 1000 characters) |
 | `audit [--limit N]` | The audit log, newest first, with any failed attempts still pending a summary row shown at the top |
 | `pairing-code`, `devices`, `revoke-device <id>` | Manage the wearer's device |
-| `reset-password` | Reset the password with the recovery PIN |
+| `reset-password` | Reset the password with the recovery PIN, and rotate the PIN |
 | `config …` | `show`, `set-client-id`, `set-api-key`, `set-mac`, `set-push-contact`, `set-max-devices`, `import-env`, `encrypt` |
 
 `lock`, `unlock` and `sync` also work with the server **stopped**: the CLI then talks to the pod directly, applying
@@ -323,7 +324,7 @@ Two events deserve attention:
 | `message_sent` | keyholder | You sent a message (its id, not its text) |
 | `login`, `password_changed` | keyholder | Sign-ins and password changes |
 | `login_failed`, `pairing_failed`, `password_change_failed`, `password_reset_failed`, `login_busy`, `password_change_busy` | system or local-cli | A wrong password, pairing code, current password on a password change, or recovery PIN; and (`…_busy`) attempts the server was too busy to even check. **Each route counts on its own**: the command line's password, the API's login, pairing codes, password changes and the PIN, so a flood on one never hides another. **The first failure in a 30-second window gets its own row at once** (`suppressed: 0`). The rest of that window are counted, shown in `audit` immediately as *pending*, and written as one summary row (`summary: true`, with the count) within about 35 seconds, even if nothing else fails afterwards |
-| `keyholder_initialised`, `password_reset` | local-cli | Account setup and recovery-PIN resets |
+| `keyholder_initialised`, `password_reset`, `pin_rotated` | local-cli | Account setup, recovery-PIN resets, and the PIN rotation that follows every successful one |
 | `pairing_code_created`, `device_revoked` | keyholder or local-cli | Managing the wearer's devices |
 | `max_devices_changed` | local-cli | The paired-device limit was changed |
 | `device_paired` | wearer | The wearer paired a device |
@@ -342,6 +343,36 @@ qiui-server reset-password        # asks for the recovery PIN, then a new passwo
 
 Run it on the server machine. Wrong PINs are refused and logged (there is no lockout), and a successful reset signs out every
 keyholder session, and the reset is recorded in the audit log as `local-cli`.
+
+**The recovery PIN is one-time.** A successful reset retires the PIN it just verified and issues a new one, so a
+PIN that has been used (or seen) once cannot be replayed:
+
+```
+qiui-server reset-password --pin ... --new-password ...
+
+Password reset. Every keyholder session was signed out.
+
+The recovery PIN you just used is now retired. New recovery PIN: 9148281112
+Write it down now; it will not be shown again.
+```
+
+- **`--new-pin <PIN>`** sets the next recovery PIN yourself (6 to 12 digits, same rule as `init`) instead of getting
+  a generated one. On success it just confirms `Recovery PIN updated.` — there is nothing new to write down, since
+  you chose it.
+- **`--quiet` / `-q`** drops the prose for scripting: on success stdout carries only the new PIN (nothing at all if
+  `--new-pin` was given), while errors still go to stderr and the exit code is still 0/1 as usual:
+  ```sh
+  new_pin=$(QIUI_RECOVERY_PIN="$old_pin" QIUI_NEW_PASSWORD="$(openssl rand -base64 24)" \
+    qiui-server reset-password --quiet) || { echo "reset failed" >&2; exit 1; }
+  ```
+- **`--env-file FILE`** writes the new password and new PIN to `FILE` as `QIUI_KEYHOLDER_PASSWORD=...` /
+  `QIUI_RECOVERY_PIN=...` lines (the same shape `.qiui_pod_env` uses), creating or overwriting it with mode `600`,
+  instead of printing them. Combine with `--quiet` for a fully silent run:
+  ```sh
+  qiui-server reset-password --quiet --env-file ~/new_pass.env
+  ```
+
+Each rotation is also logged to the audit trail as `pin_rotated`.
 
 ---
 
@@ -654,6 +685,7 @@ live credential ever sits in the database. If renewal fails, `platform_token_fai
 |---|---|
 | `QIUI_KEYHOLDER_PASSWORD` | `init` (the new password), every keyholder command, and `config set-client-id`, `set-api-key`, `import-env`, `encrypt` |
 | `QIUI_RECOVERY_PIN`, `QIUI_NEW_PASSWORD` | `init`, `reset-password` |
+| `QIUI_NEW_PIN` | `reset-password` — choose the next recovery PIN yourself instead of getting a generated one |
 | `QIUI_CLIENT_ID`, `QIUI_API_KEY` | `config set-client-id`, `config set-api-key` |
 | `QIUI_DATA_DIR` | Where the state lives |
 | `QIUI_SERVER` | Address the keyholder commands talk to (default `http://127.0.0.1:8443`) |

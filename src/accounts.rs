@@ -421,6 +421,19 @@ fn set_password(conn: &Connection, auth: &Auth, new: &str, now_ms: i64) -> Resul
     replace_password_hash(conn, &auth.hash_secret(new)?, now_ms)
 }
 
+/// A fresh recovery PIN: 10 random digits, well within `check_pin`'s 6-12 range.
+pub fn generate_pin() -> String {
+    (0..10).map(|_| (b'0' + random_below(10) as u8) as char).collect()
+}
+
+/// Replace the recovery PIN. Called after `reset_password_with_pin` succeeds, so the PIN just used
+/// to authorise that reset cannot be replayed: it behaves as a one-time code, not a static secret.
+pub fn rotate_pin(conn: &Connection, auth: &Auth, new_pin: &str) -> Result<()> {
+    check_pin(new_pin)?;
+    conn.execute("UPDATE keyholder SET pin_hash = ?1 WHERE id = 1", params![auth.hash_secret(new_pin)?])?;
+    Ok(())
+}
+
 // ---------- sessions ----------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -770,6 +783,22 @@ mod tests {
         reset_password_with_pin(&conn, &auth, PIN, "another good password", 1).unwrap();
         assert!(authenticate(&conn, &old, 2).unwrap().is_none());
         assert!(login(&conn, &auth, "another good password", 2).is_ok());
+    }
+
+    #[test]
+    fn rotating_the_pin_retires_the_old_one_and_accepts_the_new_one() {
+        let (conn, auth) = setup();
+        let generated = generate_pin();
+        rotate_pin(&conn, &auth, &generated).unwrap();
+        assert!(matches!(reset_password_with_pin(&conn, &auth, PIN, "another good password", 1), Err(AuthError::Invalid)), "old PIN no longer works");
+        reset_password_with_pin(&conn, &auth, &generated, "another good password", 1).unwrap();
+    }
+
+    #[test]
+    fn generated_pins_satisfy_check_pin() {
+        for _ in 0..50 {
+            check_pin(&generate_pin()).unwrap();
+        }
     }
 
     #[test]

@@ -197,7 +197,7 @@ credentials **do not survive a restart in decrypted form** by design — see [Fi
 | Command | What it does |
 |---|---|
 | `init` | Create the keyholder account: a password (16+ characters) and a 6–12 digit recovery PIN. First time only |
-| `reset-password` | Reset the password using the recovery PIN (`--pin`, `--new-password`). Signs out every session. **Removes the sealed QIUI credentials** (a PIN is too weak to protect them) — re-enter them afterwards with `config set-client-id`/`set-api-key` |
+| `reset-password` | Reset the password using the recovery PIN (`--pin`, `--new-password`). The PIN is one-time: on success it is retired and a new one is generated and printed (or set with `--new-pin`, to choose your own). `--quiet`/`-q` prints nothing but the new PIN (or nothing at all with `--new-pin`), for scripting. `--env-file FILE` writes the new password and PIN to FILE as `KEY=value` lines (mode 600) instead of printing them. Signs out every session. **Removes the sealed QIUI credentials** (a PIN is too weak to protect them) — re-enter them afterwards with `config set-client-id`/`set-api-key` |
 | `identify` | Scan Bluetooth and report which nearby devices look like KeyPods. No QIUI/cloud calls, no data-dir access |
 
 ---
@@ -236,12 +236,41 @@ qiui-ctl status                                       # sign in again to decrypt
 
 ```sh
 qiui-ctl reset-password --pin ...
+# a new recovery PIN is printed once — write it down now, it replaces the one you just used
+# (pass --new-pin ... instead to choose your own)
 # then, since the sealed credentials were just removed:
 qiui-ctl config set-client-id
 qiui-ctl config set-api-key
 sudo systemctl restart qiui-server
 qiui-ctl status
 ```
+
+### Scripted rotation
+
+`--quiet` (`-q`) strips the prose so stdout carries only the value a script needs; errors and the
+exit code (0/1) are unaffected, so this composes with normal shell error handling:
+
+```sh
+new_pin=$(QIUI_RECOVERY_PIN="$old_pin" QIUI_NEW_PASSWORD="$(openssl rand -base64 24)" \
+  qiui-ctl reset-password --quiet) || { echo "reset failed" >&2; exit 1; }
+# $new_pin now holds the freshly generated recovery PIN — store it somewhere safe
+```
+
+Or skip stdout entirely and have the new password and PIN written straight to a credentials file,
+in the same `KEY=value` shape as `.qiui_pod_env` — handy for chaining into the next scripted reset:
+
+```sh
+old_pass=$(cut -d= -f2 <(grep QIUI_KEYHOLDER_PASSWORD ~/old_pass.env))
+old_pin=$(cut -d= -f2 <(grep QIUI_RECOVERY_PIN ~/old_pass.env))
+
+QIUI_RECOVERY_PIN="$old_pin" QIUI_NEW_PASSWORD="$(openssl rand -base64 24)" \
+  qiui-ctl reset-password --quiet --env-file ~/new_pass.env
+mv ~/new_pass.env ~/old_pass.env   # ready for the next rotation
+```
+
+`--env-file` writes `QIUI_KEYHOLDER_PASSWORD=...` and `QIUI_RECOVERY_PIN=...` to the given path,
+creating it (or overwriting it) with permissions `600`. Combine it with `--quiet` for a fully
+silent run, or drop `--quiet` to also get the usual status line on stdout.
 
 ---
 
@@ -283,6 +312,7 @@ which is why a restart re-locks pod control until you run any keyholder command 
 |---|---|
 | `QIUI_KEYHOLDER_PASSWORD` | Any keyholder command — but not through `qiui-ctl` (sudo drops it); use `--password` |
 | `QIUI_RECOVERY_PIN`, `QIUI_NEW_PASSWORD` | `init`, `reset-password` |
+| `QIUI_NEW_PIN` | `reset-password` — choose the next recovery PIN yourself instead of getting a generated one |
 | `QIUI_CLIENT_ID`, `QIUI_API_KEY` | `config set-client-id`, `config set-api-key` |
 | `QIUI_DATA_DIR` | Already fixed to `/var/lib/qiui-server` inside `qiui-ctl` — you shouldn't need to set this yourself |
 | `QIUI_SERVER` | Address the keyholder commands talk to (default `http://127.0.0.1:8443`; `qiui-ctl` runs on the same host as the service) |
